@@ -62,22 +62,27 @@ def main():
 
     # 3. Register MCP server with Claude Code (user scope = works in all projects)
     print("[1/2] Registering MCP server...")
-    # Must use shell=True because claude mcp add uses -- as separator
-    add_cmd = (
-        f'claude mcp add -s user -t stdio '
-        f'-e MEM0_API_URL="{args.api_url}" '
-        f'-e MEM0_API_KEY="{api_key}" '
-        f'-e MEM0_USER_ID="{args.user_id}" '
-        f'em0 -- em0-mcp'
+    # Remove existing registration first (ignore errors if not found)
+    subprocess.run(
+        ["claude", "mcp", "remove", "em0", "-s", "user"],
+        capture_output=True, text=True,
     )
-    result = subprocess.run(add_cmd, shell=True, capture_output=True, text=True)
+    # Register: claude mcp add <name> <command> [options]
+    result = subprocess.run(
+        [
+            "claude", "mcp", "add",
+            "em0", "em0-mcp",
+            "-s", "user",
+            "-t", "stdio",
+            "-e", f"MEM0_API_URL={args.api_url}",
+            "-e", f"MEM0_API_KEY={api_key}",
+            "-e", f"MEM0_USER_ID={args.user_id}",
+        ],
+        capture_output=True, text=True,
+    )
     if result.returncode != 0:
-        # Might already exist — try remove + re-add
-        subprocess.run("claude mcp remove em0", shell=True, capture_output=True)
-        result = subprocess.run(add_cmd, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"Error registering MCP: {result.stderr}")
-            sys.exit(1)
+        print(f"Error registering MCP: {result.stderr.strip()}")
+        sys.exit(1)
 
     print("  Registered (user scope — works in all projects)")
 
