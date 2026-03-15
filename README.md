@@ -13,13 +13,35 @@ Provides 4 MCP tools to Claude Code:
 | `list_memories` | List all memories for a user/project |
 | `delete_memory` | Delete a specific memory by ID |
 
-## Installation
+## Quick Start
 
 ```bash
+# Install
 pip install git+https://github.com/seklabsnet/em0-mcp-wrapper.git
+
+# Setup (registers MCP server with Claude Code)
+em0-setup
+
+# For a different project
+em0-setup --user-id my-other-project
 ```
 
-## Register with Claude Code
+That's it. Restart Claude Code and the tools are available.
+
+## Setup Options
+
+```bash
+em0-setup                              # interactive (prompts for API key)
+em0-setup --api-key sk-xxx             # pass key directly
+em0-setup --user-id my-project         # set project scope
+em0-setup --api-url https://custom.url # custom server URL
+```
+
+The setup registers the MCP server at **user scope** — works in all your projects, not just one.
+
+## Manual Registration
+
+If you prefer to register manually instead of using `em0-setup`:
 
 ```bash
 claude mcp add --scope user --transport stdio em0 \
@@ -36,7 +58,7 @@ claude mcp add --scope user --transport stdio em0 \
 | `MEM0_API_URL` | Yes | — | mem0 server URL |
 | `MEM0_API_KEY` | Yes | — | API key for authentication |
 | `MEM0_USER_ID` | No | `centauri` | Default user/project scope |
-| `MEM0_TIMEOUT` | No | `30` | Request timeout (seconds) |
+| `MEM0_TIMEOUT` | No | `90` | Request timeout (seconds) |
 
 ## Development
 
