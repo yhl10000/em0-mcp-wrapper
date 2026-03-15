@@ -16,7 +16,11 @@ Provides 4 MCP tools to Claude Code:
 ## Quick Start
 
 ```bash
-# Install
+# Install (macOS with Homebrew Python)
+brew install pipx
+pipx install git+https://github.com/seklabsnet/em0-mcp-wrapper.git
+
+# Or with pip (conda, venv, or --break-system-packages)
 pip install git+https://github.com/seklabsnet/em0-mcp-wrapper.git
 
 # Setup (registers MCP server with Claude Code)
