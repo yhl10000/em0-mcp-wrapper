@@ -7,12 +7,48 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import shutil
-import subprocess
 import sys
+from pathlib import Path
 
 MEM0_DEFAULT_URL = "https://mem0-server.happygrass-15b6b68c.westeurope.azurecontainerapps.io"
+
+
+def _get_claude_config_path() -> Path:
+    """Find ~/.claude.json (Claude Code user config)."""
+    return Path.home() / ".claude.json"
+
+
+def _register_mcp(api_url: str, api_key: str, user_id: str) -> bool:
+    """Write em0 MCP server config directly into ~/.claude.json."""
+    config_path = _get_claude_config_path()
+
+    # Read existing config
+    if config_path.exists():
+        data = json.loads(config_path.read_text())
+    else:
+        data = {}
+
+    # Add/update em0 in top-level mcpServers
+    if "mcpServers" not in data:
+        data["mcpServers"] = {}
+
+    data["mcpServers"]["em0"] = {
+        "type": "stdio",
+        "command": "em0-mcp",
+        "args": [],
+        "env": {
+            "MEM0_API_URL": api_url,
+            "MEM0_API_KEY": api_key,
+            "MEM0_USER_ID": user_id,
+        },
+    }
+
+    # Write back
+    config_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return True
 
 
 def main():
@@ -39,12 +75,7 @@ def main():
 
     print("=== em0 MCP Setup ===\n")
 
-    # 1. Check claude CLI exists
-    if not shutil.which("claude"):
-        print("Error: 'claude' CLI not found. Install Claude Code first.")
-        sys.exit(1)
-
-    # 2. Get API key
+    # 1. Get API key
     api_key = args.api_key
     if not api_key:
         try:
@@ -60,31 +91,20 @@ def main():
     print(f"User ID: {args.user_id}")
     print()
 
-    # 3. Register MCP server with Claude Code (user scope = works in all projects)
+    # 2. Check em0-mcp is available
+    if not shutil.which("em0-mcp"):
+        print("Warning: 'em0-mcp' not found in PATH. Make sure it's installed.")
+
+    # 3. Register MCP server in ~/.claude.json (user scope = works in all projects)
     print("[1/2] Registering MCP server...")
-    # Remove existing registration first (ignore errors if not found)
-    subprocess.run(
-        ["claude", "mcp", "remove", "em0", "-s", "user"],
-        capture_output=True, text=True,
-    )
-    # Register: claude mcp add <name> <command> [options]
-    result = subprocess.run(
-        [
-            "claude", "mcp", "add",
-            "em0", "em0-mcp",
-            "-s", "user",
-            "-t", "stdio",
-            "-e", f"MEM0_API_URL={args.api_url}",
-            "-e", f"MEM0_API_KEY={api_key}",
-            "-e", f"MEM0_USER_ID={args.user_id}",
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"Error registering MCP: {result.stderr.strip()}")
+    config_path = _get_claude_config_path()
+    if not config_path.exists():
+        print(f"Error: {config_path} not found. Install Claude Code first.")
         sys.exit(1)
 
-    print("  Registered (user scope — works in all projects)")
+    _register_mcp(args.api_url, api_key, args.user_id)
+    print(f"  Written to {config_path}")
+    print("  Scope: user (works in all projects)")
 
     # 4. Health check
     print("[2/2] Checking server health...")
