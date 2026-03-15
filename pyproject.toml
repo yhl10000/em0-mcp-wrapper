@@ -34,6 +34,7 @@ dev = [
 
 [project.scripts]
 em0-mcp = "em0_mcp_wrapper.server:main"
+em0-setup = "em0_mcp_wrapper.setup_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
