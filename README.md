@@ -46,6 +46,16 @@ Each project gets its own isolated memory space. Same server, same DB — separa
 2. Git remote repo name (parsed from `origin` URL)
 3. Current directory name (fallback)
 
+## Where to find your API key
+
+`em0-setup` will ask for `MEM0_API_KEY` on first run. Here's where to find it:
+
+| Method | Command |
+|--------|---------|
+| From an existing machine | `claude mcp get em0` (look for `MEM0_API_KEY=...`) |
+| From Azure | `az containerapp show --name mem0-server --resource-group rg-mem0-prod --query "properties.template.containers[0].env[?name=='MEM0_API_KEY'].value" -o tsv` |
+| From team | Ask whoever deployed the mem0 server |
+
 ## Setup Options
 
 ```bash
