@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "em0-mcp-wrapper"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that bridges Claude Code to a self-hosted mem0 instance"
 readme = "README.md"
 license = { text = "MIT" }
