@@ -84,3 +84,7 @@ async def list_memories(user_id: str) -> dict:
 
 async def delete_memory(memory_id: str) -> dict:
     return await request("DELETE", f"/v1/memories/{memory_id}/")
+
+
+async def get_stats() -> dict:
+    return await request("GET", "/stats")

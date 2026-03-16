@@ -142,6 +142,28 @@ async def delete_memory(memory_id: str) -> str:
     return _dump(result)
 
 
+# ─── Tool 5: Stats ───
+@mcp.tool()
+async def memory_stats() -> str:
+    """Show cross-project statistics — how many projects use mem0, memory count per project.
+
+    Use when the user asks about mem0 usage, how many projects, or overall stats.
+    """
+    logger.info("memory_stats")
+    result = await client.get_stats()
+    if "error" in result:
+        return _dump(result)
+    lines = [f"mem0 Stats (v{result.get('version', '?')}):\n"]
+    lines.append(f"Total projects: {result.get('total_projects', 0)}")
+    lines.append(f"Total memories: {result.get('total_memories', 0)}\n")
+    projects = result.get("projects", {})
+    if projects:
+        lines.append("Per project:")
+        for name, count in projects.items():
+            lines.append(f"  {name}: {count} memories")
+    return "\n".join(lines)
+
+
 # ─── Entrypoint ───
 def main():
     logger.info("em0 MCP wrapper starting → %s", config.MEM0_API_URL)
