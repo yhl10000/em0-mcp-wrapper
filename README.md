@@ -4,7 +4,7 @@ MCP server that bridges [Claude Code](https://claude.ai/claude-code) to a self-h
 
 ## What it does
 
-Provides 4 MCP tools to Claude Code:
+Provides 5 MCP tools to Claude Code:
 
 | Tool | Purpose |
 |------|---------|
@@ -12,6 +12,7 @@ Provides 4 MCP tools to Claude Code:
 | `search_memory` | Semantic search across stored knowledge |
 | `list_memories` | List all memories for a user/project |
 | `delete_memory` | Delete a specific memory by ID |
+| `memory_stats` | Cross-project stats (total projects, memories per project) |
 
 ## Quick Start
 
