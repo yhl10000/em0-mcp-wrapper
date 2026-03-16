@@ -30,6 +30,21 @@ em0-setup
 
 That's it. Restart Claude Code and the tools are available in **all your projects**.
 
+## Updating
+
+```bash
+# pipx (recommended)
+pipx uninstall em0-mcp-wrapper
+pipx install git+https://github.com/seklabsnet/em0-mcp-wrapper.git
+
+# pip
+pip install --upgrade --force-reinstall git+https://github.com/seklabsnet/em0-mcp-wrapper.git
+```
+
+> **Note:** `pipx upgrade` may serve a cached version. Use uninstall + install to ensure you get the latest.
+
+After updating, restart Claude Code to pick up the new version.
+
 ## Multi-Project Support
 
 Project ID is **auto-detected** from your git repo name — no config needed:
