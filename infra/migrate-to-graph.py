@@ -59,27 +59,39 @@ async def migrate(user_id: str) -> None:
             skipped += 1
             continue
 
-        try:
-            res = await client.add_memory(
-                content=text,
-                user_id=user_id,
-                metadata=meta,
-            )
-            if "error" in res:
-                print(f"  [{i}/{len(memories)}] FAIL id={mem_id}: {res['error']}")
+        # Retry with backoff for rate limiting
+        for attempt in range(3):
+            try:
+                res = await client.add_memory(
+                    content=text,
+                    user_id=user_id,
+                    metadata=meta,
+                )
+                if "error" in res:
+                    err = res["error"]
+                    if "500" in str(err) and attempt < 2:
+                        wait = 10 * (attempt + 1)
+                        print(f"  [{i}/{len(memories)}] RETRY ({attempt+1}/3) waiting {wait}s...")
+                        time.sleep(wait)
+                        continue
+                    print(f"  [{i}/{len(memories)}] FAIL id={mem_id}: {err}")
+                    failed += 1
+                else:
+                    events = res.get("results", [])
+                    event = events[0].get("event", "?") if events else "DEDUP"
+                    print(f"  [{i}/{len(memories)}] OK ({event}) {text[:60]}...")
+                    success += 1
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(10 * (attempt + 1))
+                    continue
+                print(f"  [{i}/{len(memories)}] ERROR id={mem_id}: {e}")
                 failed += 1
-            else:
-                events = res.get("results", [])
-                event = events[0].get("event", "?") if events else "DEDUP"
-                print(f"  [{i}/{len(memories)}] OK ({event}) {text[:60]}...")
-                success += 1
-        except Exception as e:
-            print(f"  [{i}/{len(memories)}] ERROR id={mem_id}: {e}")
-            failed += 1
+                break
 
-        # Small delay to avoid hammering the server
-        if i % 10 == 0:
-            time.sleep(1)
+        # Delay between each request to avoid Azure OpenAI rate limiting
+        time.sleep(5)
 
     print(f"\n=== Migration complete ===")
     print(f"  Success: {success}")

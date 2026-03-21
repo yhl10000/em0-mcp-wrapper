@@ -116,17 +116,21 @@ memory = None
 graph_enabled = False
 
 
-def _patch_embedding_dims(mem_instance, dims: int):
-    """Patch Azure OpenAI client to always pass dimensions parameter."""
-    client = mem_instance.embedding_model.client
-    original_create = client.embeddings.create
+def _patch_all_embeddings(dims: int):
+    """Monkey-patch openai Embeddings class to always pass dimensions."""
+    from openai.resources import Embeddings
 
-    def patched_create(*args, **kwargs):
+    if hasattr(Embeddings, "_original_create"):
+        return  # Already patched
+
+    Embeddings._original_create = Embeddings.create
+
+    def patched_create(self, *args, **kwargs):
         kwargs["dimensions"] = dims
-        return original_create(*args, **kwargs)
+        return Embeddings._original_create(self, *args, **kwargs)
 
-    client.embeddings.create = patched_create
-    logger.info("Patched OpenAI client to always use dimensions=%d", dims)
+    Embeddings.create = patched_create
+    logger.info("Globally patched all OpenAI Embeddings to dimensions=%d", dims)
 
 
 def _get_memory():
@@ -136,7 +140,7 @@ def _get_memory():
         config = _build_config()
         try:
             memory = Memory.from_config(config)
-            _patch_embedding_dims(memory, 1024)
+            _patch_all_embeddings(1024)
             graph_enabled = bool(NEO4J_URI)
             logger.info("Memory initialized (graph=%s)", graph_enabled)
         except Exception as e:
@@ -145,7 +149,7 @@ def _get_memory():
                 logger.warning("Neo4j connection failed: %s — retrying without graph", e)
                 config.pop("graph_store", None)
                 memory = Memory.from_config(config)
-                _patch_embedding_dims(memory, 1024)
+                _patch_all_embeddings(1024)
                 graph_enabled = False
                 logger.info("Memory initialized WITHOUT graph (Neo4j unreachable)")
             else:
@@ -239,12 +243,13 @@ def add_memory(req: AddMemoryRequest, authorization: str = Header("")):
     m = _get_memory()
     try:
         content = req.messages[0]["content"] if req.messages else ""
+        metadata = dict(req.metadata) if req.metadata else {}
+        if req.immutable:
+            metadata["immutable"] = True
         kwargs: dict[str, Any] = {
             "user_id": req.user_id,
-            "metadata": req.metadata,
+            "metadata": metadata,
         }
-        if req.immutable:
-            kwargs["immutable"] = True
         if req.includes:
             kwargs["includes"] = req.includes
         if req.excludes:
@@ -465,4 +470,45 @@ def get_relations(
         return {"results": relations}
     except Exception as e:
         logger.error("get_relations error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════
+# Admin Endpoints
+# ═══════════════════════════════════════════════
+
+
+@app.post("/admin/reset-graph")
+def reset_graph(authorization: str = Header("")):
+    """Delete all nodes and relationships in Neo4j. Use with caution."""
+    _check_auth(authorization)
+    if not NEO4J_URI:
+        raise HTTPException(
+            status_code=501,
+            detail="Graph memory not enabled (NEO4J_URI not configured)",
+        )
+    m = _get_memory()
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(
+            NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+        )
+        with driver.session() as session:
+            # Count before delete
+            count = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+            # Delete all nodes and relationships
+            session.run("MATCH (n) DETACH DELETE n")
+            # Drop any vector indexes
+            indexes = session.run("SHOW INDEXES YIELD name, type WHERE type = 'VECTOR' RETURN name").data()
+            for idx in indexes:
+                session.run(f"DROP INDEX {idx['name']}")
+            logger.info("Neo4j reset: deleted %d nodes, dropped %d vector indexes", count, len(indexes))
+        driver.close()
+        return {
+            "status": "reset_complete",
+            "deleted_nodes": count,
+            "dropped_vector_indexes": len(indexes),
+        }
+    except Exception as e:
+        logger.error("reset_graph error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
