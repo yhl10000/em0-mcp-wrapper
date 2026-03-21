@@ -56,7 +56,7 @@ def _build_config() -> dict:
                 "dbname": POSTGRES_DB,
                 "user": POSTGRES_USER,
                 "password": POSTGRES_PASSWORD,
-                "collection_name": "mem0_memories",
+                "collection_name": "mem0_v3",
             },
         },
         "embedder": {
