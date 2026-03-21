@@ -1,0 +1,5 @@
+mem0ai[graph]>=0.1.0
+fastapi>=0.115.0
+uvicorn>=0.32.0
+azure-identity>=1.17.0
+openai>=1.50.0
