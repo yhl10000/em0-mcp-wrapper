@@ -117,19 +117,16 @@ graph_enabled = False
 
 
 def _patch_embedding_dims(mem_instance, dims: int):
-    """Patch Azure OpenAI embedder to use specific dimensions."""
-    original_embed = mem_instance.embedding_model.embed
+    """Patch Azure OpenAI client to always pass dimensions parameter."""
+    client = mem_instance.embedding_model.client
+    original_create = client.embeddings.create
 
-    def patched_embed(text, memory_action=None):
-        text = text.replace("\n", " ")
-        return mem_instance.embedding_model.client.embeddings.create(
-            input=[text],
-            model=mem_instance.embedding_model.config.model,
-            dimensions=dims,
-        ).data[0].embedding
+    def patched_create(*args, **kwargs):
+        kwargs["dimensions"] = dims
+        return original_create(*args, **kwargs)
 
-    mem_instance.embedding_model.embed = patched_embed
-    logger.info("Patched embedder to use dimensions=%d", dims)
+    client.embeddings.create = patched_create
+    logger.info("Patched OpenAI client to always use dimensions=%d", dims)
 
 
 def _get_memory():
