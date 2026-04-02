@@ -335,25 +335,33 @@ def stats(authorization: str = Header("")):
             password=POSTGRES_PASSWORD,
         )
         cur = conn.cursor()
-        # Find tables with user_id column
-        cur.execute("""
-            SELECT table_name FROM information_schema.columns
-            WHERE table_schema = 'public' AND column_name = 'user_id'
-        """)
-        tables_with_uid = [row[0] for row in cur.fetchall()]
-        logger.info("Tables with user_id column: %s", tables_with_uid)
 
+        # Discover all public tables and their columns
+        cur.execute("""
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+        """)
+        schema_info = {}
+        for tname, cname in cur.fetchall():
+            schema_info.setdefault(tname, []).append(cname)
+
+        # Find tables that have a user_id column
         rows = []
-        for table in tables_with_uid:
-            try:
-                cur.execute(
-                    f'SELECT user_id, COUNT(*) FROM "{table}" '
-                    f"WHERE user_id IS NOT NULL "
-                    f"GROUP BY user_id ORDER BY COUNT(*) DESC"
-                )
-                rows.extend(cur.fetchall())
-            except Exception:
-                conn.rollback()
+        debug_tables = list(schema_info.keys())
+        for table, columns in schema_info.items():
+            if "user_id" in columns:
+                try:
+                    cur.execute(
+                        f'SELECT user_id, COUNT(*) FROM "{table}" '
+                        f"WHERE user_id IS NOT NULL "
+                        f"GROUP BY user_id ORDER BY COUNT(*) DESC"
+                    )
+                    table_rows = cur.fetchall()
+                    rows.extend(table_rows)
+                except Exception:
+                    conn.rollback()
 
         cur.close()
         conn.close()
@@ -389,6 +397,7 @@ def stats(authorization: str = Header("")):
             "total_memories": sum(projects.values()),
             "projects": projects,
             "graph": graph_stats,
+            "_debug_tables": debug_tables,
         }
     except Exception as e:
         logger.error("stats error: %s", e)
