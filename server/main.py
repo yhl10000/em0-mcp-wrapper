@@ -324,19 +324,58 @@ def health():
 @app.get("/stats")
 def stats(authorization: str = Header("")):
     _check_auth(authorization)
-    m = _get_memory()
     try:
-        all_memories = m.get_all()
-        # Group by user_id
-        projects: dict[str, int] = {}
-        for mem in all_memories.get("results", []):
-            uid = mem.get("user_id", "unknown")
-            projects[uid] = projects.get(uid, 0) + 1
+        # Query pgvector directly for distinct user_ids and counts
+        import psycopg2
+        conn = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=int(POSTGRES_PORT),
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+        cur = conn.cursor()
+        # mem0 stores in 'memories' table within the collection
+        # Try common table names
+        cur.execute("""
+            SELECT user_id, COUNT(*) FROM memories
+            GROUP BY user_id ORDER BY COUNT(*) DESC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        projects = {row[0]: row[1] for row in rows if row[0]}
+
+        # Graph stats (if Neo4j enabled)
+        graph_stats = {}
+        if NEO4J_URI:
+            try:
+                from neo4j import GraphDatabase
+                driver = GraphDatabase.driver(
+                    NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+                )
+                with driver.session() as session:
+                    node_count = session.run(
+                        "MATCH (n) RETURN count(n) AS c"
+                    ).single()["c"]
+                    rel_count = session.run(
+                        "MATCH ()-[r]->() RETURN count(r) AS c"
+                    ).single()["c"]
+                    graph_stats = {
+                        "nodes": node_count,
+                        "edges": rel_count,
+                    }
+                driver.close()
+            except Exception as ge:
+                logger.warning("Graph stats failed: %s", ge)
+
         return {
-            "version": "4.0.0",
+            "version": "5.0.0",
             "total_projects": len(projects),
             "total_memories": sum(projects.values()),
             "projects": projects,
+            "graph": graph_stats,
         }
     except Exception as e:
         logger.error("stats error: %s", e)
