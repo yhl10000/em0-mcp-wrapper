@@ -327,26 +327,10 @@ def stats(authorization: str = Header("")):
     try:
         m = _get_memory()
 
-        # Simple approach: scan known project IDs via mem0 API
-        known_ids = [
-            "centauri", "centauri-ios", "centauri-backend",
-            "happybrain", "em0-mcp-wrapper", "happy-brain",
-            "pallasite", "seklabs", "default",
-        ]
-
-        projects: dict[str, int] = {}
-        for uid in known_ids:
-            try:
-                result = m.get_all(user_id=uid)
-                items = result.get("results", []) if isinstance(result, dict) else result
-                count = len(items) if isinstance(items, list) else 0
-                if count > 0:
-                    projects[uid] = count
-            except Exception:
-                pass
-
-        # Graph stats (if Neo4j enabled)
+        # Step 1: Discover all user_ids from Neo4j (dynamic, no hardcoding)
+        all_user_ids: set[str] = set()
         graph_stats = {}
+
         if NEO4J_URI:
             try:
                 from neo4j import GraphDatabase
@@ -354,6 +338,15 @@ def stats(authorization: str = Header("")):
                     NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
                 )
                 with driver.session() as session:
+                    # Get all distinct user_ids from graph
+                    uid_result = session.run(
+                        "MATCH (n) WHERE n.user_id IS NOT NULL "
+                        "RETURN DISTINCT n.user_id AS uid"
+                    ).data()
+                    for row in uid_result:
+                        if row.get("uid"):
+                            all_user_ids.add(row["uid"])
+
                     node_count = session.run(
                         "MATCH (n) RETURN count(n) AS c"
                     ).single()["c"]
@@ -367,6 +360,25 @@ def stats(authorization: str = Header("")):
                 driver.close()
             except Exception as ge:
                 logger.warning("Graph stats failed: %s", ge)
+
+        # Also include known IDs as fallback
+        all_user_ids.update([
+            "centauri", "centauri-ios", "centauri-backend",
+            "happybrain", "em0-mcp-wrapper", "happy-brain",
+            "pallasite", "seklabs",
+        ])
+
+        # Step 2: Count memories per user_id via mem0
+        projects: dict[str, int] = {}
+        for uid in sorted(all_user_ids):
+            try:
+                result = m.get_all(user_id=uid)
+                items = result.get("results", []) if isinstance(result, dict) else result
+                count = len(items) if isinstance(items, list) else 0
+                if count > 0:
+                    projects[uid] = count
+            except Exception:
+                pass
 
         return {
             "version": "5.0.0",
@@ -500,6 +512,81 @@ def add_memory(req: AddMemoryRequest, authorization: str = Header("")):
         return {"results": result if isinstance(result, list) else []}
     except Exception as e:
         logger.error("add_memory error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Search All Projects ───
+
+class SearchAllRequest(BaseModel):
+    query: str
+    limit: int = 5
+
+
+@app.post("/v1/memories/search-all/")
+def search_all_projects(req: SearchAllRequest, authorization: str = Header("")):
+    """Search across ALL projects — no user_id needed.
+
+    Discovers all known user_ids from Neo4j graph, then searches each project.
+    Returns aggregated results sorted by score.
+    """
+    _check_auth(authorization)
+    m = _get_memory()
+    try:
+        # Discover user_ids from Neo4j
+        user_ids: set[str] = set()
+        if NEO4J_URI:
+            try:
+                from neo4j import GraphDatabase
+                driver = GraphDatabase.driver(
+                    NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+                )
+                with driver.session() as session:
+                    rows = session.run(
+                        "MATCH (n) WHERE n.user_id IS NOT NULL "
+                        "RETURN DISTINCT n.user_id AS uid"
+                    ).data()
+                    for row in rows:
+                        if row.get("uid"):
+                            user_ids.add(row["uid"])
+                driver.close()
+            except Exception:
+                pass
+
+        # Fallback known IDs
+        user_ids.update([
+            "centauri", "happybrain", "em0-mcp-wrapper",
+            "centauri-ios", "centauri-backend", "happy-brain",
+            "pallasite", "seklabs",
+        ])
+
+        # Search each project
+        all_results = []
+        for uid in user_ids:
+            try:
+                results = m.search(query=req.query, user_id=uid, limit=req.limit)
+                items = results.get("results", []) if isinstance(results, dict) else results
+                if isinstance(items, list):
+                    for item in items:
+                        item["_project"] = uid
+                    all_results.extend(items)
+            except Exception:
+                pass
+
+        # Sort by score descending, take top N
+        all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        top_results = all_results[:req.limit]
+
+        # Apply freshness scoring
+        top_results = _apply_freshness(top_results)
+
+        return {
+            "query": req.query,
+            "projects_searched": len(user_ids),
+            "total_matches": len(all_results),
+            "results": top_results,
+        }
+    except Exception as e:
+        logger.error("search_all error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

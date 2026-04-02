@@ -188,6 +188,62 @@ async def search_memory(
     return _dump(result)
 
 
+# ─── Tool 2b: Search All Projects ───
+@mcp.tool()
+async def search_all_projects(
+    query: str,
+    limit: int = 5,
+) -> str:
+    """Search across ALL projects — no user_id needed.
+
+    Use when you don't know which project has the information,
+    or want to find knowledge across the entire em0 brain.
+
+    Examples:
+    - "What do we know about PostgreSQL?" (finds across centauri, happybrain, etc.)
+    - "What auth decisions were made?" (searches all projects)
+    - "What's the architecture of pal-csm?" (discovers project automatically)
+
+    Args:
+        query: Natural language search query
+        limit: Max results across all projects (default: 5)
+    """
+    logger.info("search_all_projects: query='%s'", query)
+    result = await client.search_all_projects(query=query, limit=limit)
+    if "error" in result:
+        return _dump(result)
+
+    items = result.get("results", [])
+    if not items:
+        return (
+            f"No memories found for '{query}' across "
+            f"{result.get('projects_searched', 0)} projects."
+        )
+
+    lines = [
+        f"Found {result.get('total_matches', 0)} result(s) for '{query}' "
+        f"across {result.get('projects_searched', 0)} projects:\n"
+    ]
+    for i, m in enumerate(items, 1):
+        meta = m.get("metadata", {})
+        project = m.get("_project", m.get("user_id", "?"))
+        domain = meta.get("domain", "?")
+        mtype = meta.get("type", "?")
+        final = m.get("final_score")
+        semantic = m.get("score", 0)
+        freshness = m.get("freshness")
+        score_str = (
+            f"score={final:.2f} (semantic={semantic:.2f}, fresh={freshness})"
+            if final is not None and freshness is not None
+            else f"score={semantic:.2f}"
+        )
+        lines.append(
+            f"{i}. [{project}] [{domain}/{mtype}] {m.get('memory', '')}\n"
+            f"   {score_str} | id={m.get('id', '?')}"
+        )
+    return "\n".join(lines)
+
+
 # ─── Tool 3: List Memories ───
 @mcp.tool()
 async def list_memories(user_id: str = "") -> str:

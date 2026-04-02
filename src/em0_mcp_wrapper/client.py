@@ -176,6 +176,14 @@ async def get_graph_summary(project_id: str) -> dict:
     return await request("GET", f"/v1/resources/graph-summary/{project_id}")
 
 
+async def search_all_projects(query: str, limit: int = 5) -> dict:
+    """Search across ALL projects — no user_id needed."""
+    return await request(
+        "POST", "/v1/memories/search-all/",
+        json={"query": query, "limit": limit},
+    )
+
+
 async def search_cross_project(
     query: str, user_id: str, limit: int = 10,
 ) -> dict:
