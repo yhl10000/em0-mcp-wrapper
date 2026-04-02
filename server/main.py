@@ -327,63 +327,23 @@ def stats(authorization: str = Header("")):
     try:
         m = _get_memory()
 
-        # Use mem0's internal vector store connection to query user_ids
+        # Scan known projects via mem0 API (no raw SQL needed)
+        known_ids = [
+            "centauri", "centauri-ios", "centauri-backend",
+            "happybrain", "em0-mcp-wrapper", "happy-brain",
+            "pallasite", "seklabs", "default",
+        ]
+
         projects: dict[str, int] = {}
-        debug_tables: list[str] = []
-
-        try:
-            # Access mem0's internal pgvector connection
-            vs = m.vector_store
-            # mem0 pgvector uses a 'memories' table internally
-            conn = vs.client if hasattr(vs, 'client') else None
-
-            if conn is None:
-                # Fallback: use psycopg2 directly
-                import psycopg2
-                conn = psycopg2.connect(
-                    host=POSTGRES_HOST,
-                    port=int(POSTGRES_PORT),
-                    dbname=POSTGRES_DB,
-                    user=POSTGRES_USER,
-                    password=POSTGRES_PASSWORD,
-                    sslmode="require",
-                )
-
-            cur = conn.cursor()
-
-            # Discover tables
-            cur.execute("""
-                SELECT table_schema || '.' || table_name
-                FROM information_schema.tables
-                WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-            """)
-            debug_tables = [row[0] for row in cur.fetchall()]
-
-            # Try known mem0 patterns for user_id storage
-            rows = []
-            for query in [
-                # Pattern 1: user_id as column
-                "SELECT user_id, COUNT(*) FROM memories WHERE user_id IS NOT NULL GROUP BY user_id ORDER BY COUNT(*) DESC",
-                # Pattern 2: mem0_v3 collection
-                "SELECT user_id, COUNT(*) FROM mem0_v3 WHERE user_id IS NOT NULL GROUP BY user_id ORDER BY COUNT(*) DESC",
-                # Pattern 3: metadata JSON
-                "SELECT metadata->>'user_id', COUNT(*) FROM mem0_v3 WHERE metadata->>'user_id' IS NOT NULL GROUP BY metadata->>'user_id' ORDER BY COUNT(*) DESC",
-                # Pattern 4: langchain_pg_embedding (pgvector default)
-                "SELECT cmetadata->>'user_id', COUNT(*) FROM langchain_pg_embedding WHERE cmetadata->>'user_id' IS NOT NULL GROUP BY cmetadata->>'user_id' ORDER BY COUNT(*) DESC",
-            ]:
-                try:
-                    cur.execute(query)
-                    rows = cur.fetchall()
-                    if rows:
-                        break
-                except Exception:
-                    conn.rollback()
-
-            cur.close()
-            projects = {row[0]: row[1] for row in rows if row[0]}
-        except Exception as db_err:
-            logger.warning("DB stats query failed: %s", db_err)
-            debug_tables.append(f"ERROR: {db_err}")
+        for uid in known_ids:
+            try:
+                result = m.get_all(user_id=uid)
+                items = result.get("results", []) if isinstance(result, dict) else result
+                count = len(items) if isinstance(items, list) else 0
+                if count > 0:
+                    projects[uid] = count
+            except Exception:
+                pass
 
         # Graph stats (if Neo4j enabled)
         graph_stats = {}
@@ -414,7 +374,6 @@ def stats(authorization: str = Header("")):
             "total_memories": sum(projects.values()),
             "projects": projects,
             "graph": graph_stats,
-            "_debug_tables": debug_tables,
         }
     except Exception as e:
         logger.error("stats error: %s", e, exc_info=True)

@@ -309,13 +309,6 @@ async def memory_stats() -> str:
         lines.append(f"\nKnowledge Graph:")
         lines.append(f"  Nodes: {graph.get('nodes', 0)}")
         lines.append(f"  Edges: {graph.get('edges', 0)}")
-    debug = result.get("_debug_tables")
-    if debug is not None:
-        lines.append(f"\nDB tables ({len(debug)}): {', '.join(debug[:20]) if debug else 'NONE FOUND'}")
-    if "error" in result:
-        lines.append(f"\nError: {result['error']}")
-        lines.append(f"Type: {result.get('error_type', '?')}")
-        lines.append(f"DB: {result.get('db_user', '?')}@{result.get('db_host', '?')}/{result.get('db_name', '?')}")
     return "\n".join(lines)
 
 
