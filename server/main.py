@@ -335,41 +335,25 @@ def stats(authorization: str = Header("")):
             password=POSTGRES_PASSWORD,
         )
         cur = conn.cursor()
-        # Find mem0's table name dynamically
+        # Find tables with user_id column
         cur.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'public'
-            AND table_name LIKE '%memor%'
-            ORDER BY table_name
+            SELECT table_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND column_name = 'user_id'
         """)
-        tables = [row[0] for row in cur.fetchall()]
+        tables_with_uid = [row[0] for row in cur.fetchall()]
+        logger.info("Tables with user_id column: %s", tables_with_uid)
 
         rows = []
-        for table in tables:
+        for table in tables_with_uid:
             try:
-                cur.execute(f"""
-                    SELECT user_id, COUNT(*) FROM "{table}"
-                    WHERE user_id IS NOT NULL
-                    GROUP BY user_id ORDER BY COUNT(*) DESC
-                """)
+                cur.execute(
+                    f'SELECT user_id, COUNT(*) FROM "{table}" '
+                    f"WHERE user_id IS NOT NULL "
+                    f"GROUP BY user_id ORDER BY COUNT(*) DESC"
+                )
                 rows.extend(cur.fetchall())
             except Exception:
                 conn.rollback()
-
-        # If no memory tables found, try common names
-        if not rows and not tables:
-            for tname in ["memories", "mem0_v3", "vectors"]:
-                try:
-                    cur.execute(f"""
-                        SELECT user_id, COUNT(*) FROM "{tname}"
-                        WHERE user_id IS NOT NULL
-                        GROUP BY user_id ORDER BY COUNT(*) DESC
-                    """)
-                    rows = cur.fetchall()
-                    if rows:
-                        break
-                except Exception:
-                    conn.rollback()
 
         cur.close()
         conn.close()
