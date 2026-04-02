@@ -237,3 +237,164 @@ async def test_http_error():
     result = await client.search_memory("test", "user1")
     assert "error" in result
     assert "401" in result["error"]
+
+
+# ─── Resource Client Tests ───
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_context():
+    respx.get("https://test-mem0.example.com/v1/context/myproject").mock(
+        return_value=httpx.Response(200, json={
+            "project": "myproject",
+            "recent_decisions": [
+                {"memory": "Use PostgreSQL", "domain": "backend", "type": "decision"}
+            ],
+            "immutable_lessons": [
+                {"memory": "Always use 1024d embeddings", "domain": "infra"}
+            ],
+            "graph_relations": [],
+            "stats": {"total_memories": 42, "immutable_count": 3, "graph_relations_count": 0},
+        })
+    )
+    result = await client.get_context("myproject")
+    assert result["project"] == "myproject"
+    assert len(result["recent_decisions"]) == 1
+    assert result["stats"]["total_memories"] == 42
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_project_summary():
+    respx.get("https://test-mem0.example.com/v1/resources/summary/myproject").mock(
+        return_value=httpx.Response(200, json={
+            "project": "myproject",
+            "total_memories": 47,
+            "domains": {"auth": 12, "backend": 8},
+            "key_decisions": ["Use JWT"],
+            "last_updated": "2026-04-01",
+        })
+    )
+    result = await client.get_project_summary("myproject")
+    assert result["total_memories"] == 47
+    assert "auth" in result["domains"]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_graph_summary():
+    respx.get("https://test-mem0.example.com/v1/resources/graph-summary/myproject").mock(
+        return_value=httpx.Response(200, json={
+            "project": "myproject",
+            "entity_types": {"person": 2, "service": 3},
+            "entities": {"person": ["Erkut", "Kaan"], "service": ["AuthService"]},
+            "relations": [{"source": "Erkut", "relation": "decided", "target": "PostgreSQL"}],
+            "total_relations": 1,
+        })
+    )
+    result = await client.get_graph_summary("myproject")
+    assert result["entity_types"]["person"] == 2
+    assert "Erkut" in result["entities"]["person"]
+
+
+# ─── Compaction Client Tests ───
+
+
+# ─── Cross-Project Search Tests ───
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_cross_project():
+    respx.post("https://test-mem0.example.com/v1/search/cross-project").mock(
+        return_value=httpx.Response(200, json={
+            "current_project": "centauri",
+            "entities_in_project": 15,
+            "other_projects_checked": 2,
+            "cross_relations": [
+                {
+                    "entity": "postgresql",
+                    "relation": "uses",
+                    "connected_to": "pgvector",
+                    "other_project": "em0-mcp-wrapper",
+                    "direction": "outgoing",
+                },
+                {
+                    "entity": "erkut",
+                    "relation": "decided",
+                    "connected_to": "swiftui",
+                    "other_project": "centauri-ios",
+                    "direction": "outgoing",
+                },
+            ],
+            "search_context": ["PostgreSQL v15 is the database"],
+        })
+    )
+    result = await client.search_cross_project("PostgreSQL", "centauri")
+    assert result["current_project"] == "centauri"
+    assert len(result["cross_relations"]) == 2
+    assert result["cross_relations"][0]["other_project"] == "em0-mcp-wrapper"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_cross_project_no_results():
+    respx.post("https://test-mem0.example.com/v1/search/cross-project").mock(
+        return_value=httpx.Response(200, json={
+            "current_project": "solo-project",
+            "entities_in_project": 5,
+            "other_projects_checked": 0,
+            "cross_relations": [],
+            "search_context": [],
+        })
+    )
+    result = await client.search_cross_project("something", "solo-project")
+    assert result["cross_relations"] == []
+    assert result["other_projects_checked"] == 0
+
+
+# ─── Compaction Client Tests ───
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_compact_memories_dry_run():
+    respx.post("https://test-mem0.example.com/admin/compact").mock(
+        return_value=httpx.Response(200, json={
+            "dry_run": True,
+            "plan": [
+                {
+                    "group": "backend:decision",
+                    "memories_to_merge": 4,
+                    "preview": ["Use PostgreSQL", "PostgreSQL v15", "DB is PostgreSQL", "Chose PostgreSQL"],
+                }
+            ],
+            "total_groups_analyzed": 5,
+            "total_merged": 0,
+            "memories_saved": 0,
+        })
+    )
+    result = await client.compact_memories("myproject", dry_run=True)
+    assert result["dry_run"] is True
+    assert len(result["plan"]) == 1
+    assert result["plan"][0]["memories_to_merge"] == 4
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_compact_memories_apply():
+    route = respx.post("https://test-mem0.example.com/admin/compact")
+    route.mock(return_value=httpx.Response(200, json={
+        "dry_run": False,
+        "plan": [{"group": "backend:decision", "merged": 4, "into_summary": "PostgreSQL v15 is the database"}],
+        "total_groups_analyzed": 5,
+        "total_merged": 4,
+        "memories_saved": 3,
+    }))
+    result = await client.compact_memories("myproject", dry_run=False)
+    assert result["dry_run"] is False
+    assert result["total_merged"] == 4
+    assert result["memories_saved"] == 3
+    body = json.loads(route.calls[0].request.content)
+    assert body["dry_run"] is False

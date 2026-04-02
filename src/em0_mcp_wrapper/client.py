@@ -156,3 +156,51 @@ async def delete_entity(user_id: str, entity_name: str) -> dict:
         "DELETE", f"/v1/entities/{entity_name}/",
         params={"user_id": user_id},
     )
+
+
+# ─── Resources ───
+
+
+async def get_context(project_id: str) -> dict:
+    """Get auto-context for a project (session start)."""
+    return await request("GET", f"/v1/context/{project_id}")
+
+
+async def get_project_summary(project_id: str) -> dict:
+    """Get project memory summary."""
+    return await request("GET", f"/v1/resources/summary/{project_id}")
+
+
+async def get_graph_summary(project_id: str) -> dict:
+    """Get knowledge graph summary."""
+    return await request("GET", f"/v1/resources/graph-summary/{project_id}")
+
+
+async def search_cross_project(
+    query: str, user_id: str, limit: int = 10,
+) -> dict:
+    """Search for cross-project entity connections."""
+    return await request(
+        "POST",
+        "/v1/search/cross-project",
+        json={"query": query, "user_id": user_id, "limit": limit},
+    )
+
+
+async def compact_memories(
+    user_id: str,
+    dry_run: bool = True,
+    min_cluster_size: int = 3,
+    similarity_threshold: float = 0.85,
+) -> dict:
+    """Compact similar memories within domain+type groups."""
+    return await request(
+        "POST",
+        "/admin/compact",
+        json={
+            "user_id": user_id,
+            "dry_run": dry_run,
+            "min_cluster_size": min_cluster_size,
+            "similarity_threshold": similarity_threshold,
+        },
+    )

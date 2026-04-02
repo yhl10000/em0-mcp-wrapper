@@ -90,6 +90,19 @@ async def add_memory(
     # Interpret empty results — mem0 returns [] when content is deduplicated
     if "results" in result and len(result["results"]) == 0:
         result["message"] = "Already known — mem0 deduplicated this (similar memory exists)."
+
+    # Format conflict warnings for readability
+    conflicts = result.get("conflicts", [])
+    if conflicts:
+        lines = [_dump(result), "", "POTENTIAL CONFLICTS:"]
+        for c in conflicts:
+            lines.append(
+                f"  - Existing: \"{c['existing_memory'][:150]}\"\n"
+                f"    id={c['existing_id']} similarity={c['similarity_score']}\n"
+                f"    -> {c['suggestion']}"
+            )
+        return "\n".join(lines)
+
     return _dump(result)
 
 
@@ -144,9 +157,18 @@ async def search_memory(
             domain_tag = meta.get("domain", "?")
             type_tag = meta.get("type", "?")
             source = meta.get("source", "?")
+            # Use final_score (freshness-adjusted) when available
+            final = m.get("final_score")
+            semantic = m.get("score", 0)
+            freshness = m.get("freshness")
+            score_str = (
+                f"score={final:.2f} (semantic={semantic:.2f}, fresh={freshness})"
+                if final is not None and freshness is not None
+                else f"score={semantic:.2f}"
+            )
             lines.append(
                 f"{i}. [{domain_tag}/{type_tag}] {m.get('memory', '')}\n"
-                f"   score={m.get('score', '?'):.2f}"
+                f"   {score_str}"
                 f" | source={source} | id={m.get('id', '?')}"
             )
         # Show graph relations if present (Neo4j enabled)
@@ -420,9 +442,239 @@ async def delete_entity(
     return _dump(result)
 
 
+# ─── Tool 13: Cross-Project Search ───
+@mcp.tool()
+async def search_cross_project(
+    query: str,
+    user_id: str = "",
+    limit: int = 10,
+) -> str:
+    """Search for entities shared across multiple projects.
+
+    Finds how an entity (e.g. PostgreSQL, Azure, a person) is used
+    in other projects. Useful for:
+    - "How is PostgreSQL configured in other projects?"
+    - "What decisions has Erkut made across all projects?"
+    - "Which projects use Redis?"
+
+    Requires Neo4j graph to be enabled.
+
+    Args:
+        query: What to search for
+        user_id: Current project scope (empty = default)
+        limit: Max cross-project relations to return (default: 10)
+    """
+    uid = user_id or config.DEFAULT_USER_ID
+    logger.info("search_cross_project: query='%s' user=%s", query, uid)
+    result = await client.search_cross_project(query=query, user_id=uid, limit=limit)
+    if "error" in result:
+        return _dump(result)
+
+    lines = [
+        f"Cross-Project Search: '{query}'\n",
+        f"Current project: {result.get('current_project', '?')}",
+        f"Entities in project graph: {result.get('entities_in_project', 0)}",
+        f"Other projects checked: {result.get('other_projects_checked', 0)}\n",
+    ]
+
+    cross = result.get("cross_relations", [])
+    if cross:
+        lines.append(f"Cross-Project Relations ({len(cross)}):")
+        for r in cross:
+            direction = "-->" if r.get("direction") == "outgoing" else "<--"
+            lines.append(
+                f"  {r['entity']} {direction}[{r['relation']}]{direction} "
+                f"{r['connected_to']}  (project: {r['other_project']})"
+            )
+    else:
+        lines.append("No cross-project connections found.")
+
+    context = result.get("search_context", [])
+    if context:
+        lines.append("\nSearch context from current project:")
+        for c in context:
+            lines.append(f"  - {c}")
+
+    return "\n".join(lines)
+
+
+# ─── Tool 14: Compact Memories ───
+@mcp.tool()
+async def compact_memories(
+    user_id: str = "",
+    dry_run: bool = True,
+    min_cluster_size: int = 3,
+) -> str:
+    """Compact similar memories by merging them into concise summaries.
+
+    Reduces memory bloat by grouping similar memories within the same
+    domain+type and merging them with an LLM. Immutable memories are skipped.
+
+    IMPORTANT: Run with dry_run=True first to preview what will be merged.
+    Then run with dry_run=False to apply.
+
+    Args:
+        user_id: Project scope (empty = default from config)
+        dry_run: True=preview only, False=actually merge (default: True)
+        min_cluster_size: Minimum memories in a group to trigger compaction (default: 3)
+    """
+    uid = user_id or config.DEFAULT_USER_ID
+    logger.info("compact_memories: user=%s dry_run=%s", uid, dry_run)
+    result = await client.compact_memories(
+        user_id=uid,
+        dry_run=dry_run,
+        min_cluster_size=min_cluster_size,
+    )
+    if "error" in result:
+        return _dump(result)
+
+    lines = []
+    if result.get("dry_run"):
+        lines.append("COMPACTION PREVIEW (dry_run=True, nothing changed yet):\n")
+    else:
+        lines.append("COMPACTION APPLIED:\n")
+
+    lines.append(f"Groups analyzed: {result.get('total_groups_analyzed', 0)}")
+    lines.append(f"Memories merged: {result.get('total_merged', 0)}")
+    lines.append(f"Memories saved: {result.get('memories_saved', 0)}\n")
+
+    plan = result.get("plan", [])
+    if plan:
+        lines.append("Plan:")
+        for p in plan:
+            if result.get("dry_run"):
+                lines.append(f"  [{p['group']}] {p['memories_to_merge']} memories to merge:")
+                for preview in p.get("preview", []):
+                    lines.append(f"    - {preview}")
+            else:
+                lines.append(
+                    f"  [{p['group']}] merged {p.get('merged', '?')} → "
+                    f"\"{p.get('into_summary', '?')}\""
+                )
+    else:
+        lines.append("No groups eligible for compaction.")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════
+# MCP Resources (passive context, read by clients)
+# ═══════════════════════════════════════════════════
+
+
+# ─── Resource 1: Auto-Context ───
+@mcp.resource("memory://context/{project_id}")
+async def auto_context_resource(project_id: str) -> str:
+    """Session-start context — relevant decisions, immutable lessons, graph relations.
+
+    MCP clients read this resource at session start to load project context
+    without manually calling search_memory. Only returns the most relevant
+    memories (~500-1000 tokens), not the entire memory store.
+    """
+    result = await client.get_context(project_id)
+    if "error" in result:
+        return _dump(result)
+
+    lines = [f"# em0 Context: {result.get('project', '?')}\n"]
+
+    # Stats
+    stats = result.get("stats", {})
+    lines.append(
+        f"*{stats.get('total_memories', 0)} memories, "
+        f"{stats.get('immutable_count', 0)} immutable, "
+        f"{stats.get('graph_relations_count', 0)} graph relations*\n"
+    )
+
+    # Recent decisions
+    decisions = result.get("recent_decisions", [])
+    if decisions:
+        lines.append("## Recent Decisions")
+        for d in decisions:
+            domain = d.get("domain", "?")
+            mtype = d.get("type", "?")
+            fresh = d.get("freshness")
+            fresh_str = f" (fresh={fresh})" if fresh is not None else ""
+            lines.append(f"- [{domain}/{mtype}] {d.get('memory', '')}{fresh_str}")
+
+    # Immutable lessons
+    immutables = result.get("immutable_lessons", [])
+    if immutables:
+        lines.append("\n## Immutable Lessons (always apply)")
+        for im in immutables:
+            domain = im.get("domain", "?")
+            lines.append(f"- [{domain}] {im.get('memory', '')}")
+
+    # Graph relations
+    relations = result.get("graph_relations", [])
+    if relations:
+        lines.append(f"\n## Key Relations ({len(relations)})")
+        for r in relations:
+            lines.append(f"- {r['source']} --{r['relation']}--> {r['target']}")
+
+    return "\n".join(lines)
+
+
+# ─── Resource 2: Project Summary ───
+@mcp.resource("memory://project/{project_id}/summary")
+async def project_summary_resource(project_id: str) -> str:
+    """Project memory overview — domain distribution and key decisions."""
+    result = await client.get_project_summary(project_id)
+    if "error" in result:
+        return _dump(result)
+
+    lines = [f"# em0 Summary: {result.get('project', '?')}\n"]
+    lines.append(f"Total memories: {result.get('total_memories', 0)}")
+    lines.append(f"Last updated: {result.get('last_updated', '?')}\n")
+
+    domains = result.get("domains", {})
+    if domains:
+        lines.append("## Domains")
+        for d, count in sorted(domains.items(), key=lambda x: -x[1]):
+            lines.append(f"- {d}: {count} memories")
+
+    decisions = result.get("key_decisions", [])
+    if decisions:
+        lines.append("\n## Key Decisions")
+        for d in decisions:
+            lines.append(f"- {d}")
+
+    return "\n".join(lines)
+
+
+# ─── Resource 3: Graph Overview ───
+@mcp.resource("memory://project/{project_id}/graph")
+async def graph_overview_resource(project_id: str) -> str:
+    """Knowledge graph overview — entities and relationships."""
+    result = await client.get_graph_summary(project_id)
+    if "error" in result:
+        return _dump(result)
+
+    lines = [f"# Knowledge Graph: {result.get('project', '?')}\n"]
+
+    entities = result.get("entities", {})
+    if entities:
+        lines.append("## Entities")
+        for etype, names in entities.items():
+            lines.append(f"- [{etype}] ({len(names)}): {', '.join(names[:20])}")
+
+    total = result.get("total_relations", 0)
+    relations = result.get("relations", [])
+    if relations:
+        lines.append(f"\n## Relations ({total} total)")
+        for r in relations[:20]:
+            lines.append(
+                f"- {r.get('source', '?')} --{r.get('relation', '?')}--> "
+                f"{r.get('target', '?')}"
+            )
+        if total > 20:
+            lines.append(f"- ... and {total - 20} more")
+
+    return "\n".join(lines)
+
+
 # ─── Entrypoint ───
 def main():
-    logger.info("em0 MCP wrapper v0.4.0 starting → %s", config.MEM0_API_URL)
+    logger.info("em0 MCP wrapper v0.5.0 starting → %s", config.MEM0_API_URL)
     mcp.run(transport="stdio")
 
 

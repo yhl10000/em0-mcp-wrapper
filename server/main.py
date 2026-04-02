@@ -16,6 +16,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -43,6 +44,13 @@ AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY", "")
 NEO4J_URI = os.environ.get("NEO4J_URI", "")
 NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+
+# Webhook config
+WEBHOOK_URLS = [u.strip() for u in os.environ.get("WEBHOOK_URLS", "").split(",") if u.strip()]
+WEBHOOK_EVENTS = set(
+    os.environ.get("WEBHOOK_EVENTS", "memory.created,memory.updated,memory.conflict").split(",")
+)
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 
 def _build_config() -> dict:
@@ -188,6 +196,105 @@ class UpdateMemoryRequest(BaseModel):
     data: str
 
 
+# ─── Freshness Scoring ───
+
+def _apply_freshness(results: list[dict]) -> list[dict]:
+    """Apply temporal decay + popularity scoring to search results."""
+    now = datetime.now(timezone.utc)
+
+    for item in results:
+        meta = item.get("metadata", {})
+        semantic_score = item.get("score", 0)
+
+        # Immutable memories are exempt from decay
+        if meta.get("immutable"):
+            item["final_score"] = semantic_score
+            item["freshness"] = 1.0
+            continue
+
+        # Age calculation
+        last_access = meta.get("last_accessed_at") or item.get("created_at", "")
+        if last_access:
+            try:
+                last_dt = datetime.fromisoformat(
+                    last_access.replace("Z", "+00:00")
+                )
+                age_days = (now - last_dt).days
+            except (ValueError, TypeError):
+                age_days = 180
+        else:
+            age_days = 180
+
+        freshness = max(0.5, 1.0 - (age_days / 365) * 0.5)
+
+        # Popularity bonus — frequently accessed memories are valuable
+        access_count = meta.get("access_count", 0)
+        popularity = min(1.2, 1.0 + access_count * 0.02)
+
+        final_score = semantic_score * freshness * popularity
+        item["final_score"] = round(final_score, 4)
+        item["freshness"] = round(freshness, 3)
+
+    # Re-sort by final_score
+    results.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+    return results
+
+
+def _track_access(m, memory_ids: list[str]):
+    """Update last_accessed_at and access_count for retrieved memories."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for mid in memory_ids:
+        try:
+            mem = m.get(mid)
+            if not isinstance(mem, dict):
+                continue
+            meta = mem.get("metadata", {})
+            meta["last_accessed_at"] = now_iso
+            meta["access_count"] = meta.get("access_count", 0) + 1
+            m.update(mid, data=mem.get("memory", ""), metadata=meta)
+        except Exception as e:
+            logger.debug("access tracking skipped for %s: %s", mid, e)
+
+
+# ─── Webhook Dispatcher ───
+
+def _dispatch_webhook(event: str, payload: dict):
+    """Fire-and-forget webhook notification. Non-blocking."""
+    if event not in WEBHOOK_EVENTS or not WEBHOOK_URLS:
+        return
+
+    import hashlib
+    import hmac
+    import threading
+
+    def _send():
+        import json as _json
+
+        body = _json.dumps({
+            "event": event,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": payload,
+        })
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if WEBHOOK_SECRET:
+            sig = hmac.new(
+                WEBHOOK_SECRET.encode(), body.encode(), hashlib.sha256,
+            ).hexdigest()
+            headers["X-Signature-256"] = f"sha256={sig}"
+
+        for url in WEBHOOK_URLS:
+            try:
+                import httpx as _httpx
+                with _httpx.Client(timeout=10) as c:
+                    resp = c.post(url, content=body, headers=headers)
+                    logger.info("Webhook %s → %s: %d", event, url[:50], resp.status_code)
+            except Exception as e:
+                logger.warning("Webhook failed %s → %s: %s", event, url[:50], e)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 # ─── App ───
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -236,6 +343,58 @@ def stats(authorization: str = Header("")):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── Conflict Detection ───
+
+CONFLICT_THRESHOLD = float(os.environ.get("CONFLICT_THRESHOLD", "0.80"))
+
+
+def _normalize_text(text: str) -> str:
+    """Simple normalization for dedup comparison."""
+    return " ".join(text.lower().split())
+
+
+def _check_conflicts(
+    m, content: str, user_id: str, threshold: float = CONFLICT_THRESHOLD,
+) -> list[dict]:
+    """Find existing memories that may conflict with new content."""
+    try:
+        results = m.search(query=content, user_id=user_id, limit=3)
+        items = results.get("results", []) if isinstance(results, dict) else results
+
+        conflicts = []
+        for item in items:
+            score = item.get("score", 0)
+            existing = item.get("memory", "")
+
+            if score < threshold:
+                continue
+
+            # Same content = dedup, not conflict
+            if _normalize_text(content) == _normalize_text(existing):
+                continue
+
+            conflict_entry = {
+                "existing_memory": existing,
+                "existing_id": item.get("id", "?"),
+                "similarity_score": round(score, 3),
+                "suggestion": "Consider updating this memory instead.",
+            }
+
+            # Extra warning if conflicting with immutable
+            if item.get("metadata", {}).get("immutable"):
+                conflict_entry["suggestion"] = (
+                    "IMMUTABLE memory — cannot be updated. "
+                    "Verify this new information is correct before adding."
+                )
+
+            conflicts.append(conflict_entry)
+
+        return conflicts
+    except Exception as e:
+        logger.warning("Conflict check failed (non-blocking): %s", e)
+        return []
+
+
 # ─── Add Memory ───
 @app.post("/v1/memories/")
 def add_memory(req: AddMemoryRequest, authorization: str = Header("")):
@@ -255,7 +414,49 @@ def add_memory(req: AddMemoryRequest, authorization: str = Header("")):
         if req.excludes:
             kwargs["excludes"] = req.excludes
 
+        # Conflict detection (non-blocking, runs before add)
+        conflicts = _check_conflicts(m, content, req.user_id)
+
         result = m.add(content, **kwargs)
+
+        # Attach conflicts to response
+        if conflicts:
+            if isinstance(result, dict):
+                result["conflicts"] = conflicts
+                result["conflict_warning"] = (
+                    f"{len(conflicts)} potential conflict(s) found. "
+                    "Review existing memories."
+                )
+            else:
+                result = {
+                    "results": result if isinstance(result, list) else [],
+                    "conflicts": conflicts,
+                    "conflict_warning": (
+                        f"{len(conflicts)} potential conflict(s) found. "
+                        "Review existing memories."
+                    ),
+                }
+
+        # Webhook: memory.created
+        _dispatch_webhook("memory.created", {
+            "user_id": req.user_id,
+            "content": content[:500],
+            "domain": metadata.get("domain", ""),
+            "type": metadata.get("type", ""),
+            "immutable": req.immutable,
+        })
+
+        # Webhook: memory.conflict
+        if conflicts:
+            _dispatch_webhook("memory.conflict", {
+                "user_id": req.user_id,
+                "new_content": content[:300],
+                "conflicts": [
+                    {"existing": c["existing_memory"][:200], "score": c["similarity_score"]}
+                    for c in conflicts
+                ],
+            })
+
         # Normalize response
         if isinstance(result, dict):
             return result
@@ -298,12 +499,24 @@ def search_memory(req: SearchRequest, authorization: str = Header("")):
                         }
             except Exception as ge:
                 logger.warning("Graph search failed, returning vector only: %s", ge)
+
+            # Apply freshness scoring
+            if isinstance(results, dict) and "results" in results:
+                results["results"] = _apply_freshness(results["results"])
+                _track_access(m, [i.get("id") for i in results["results"] if i.get("id")])
             return results if isinstance(results, dict) else {"results": results}
 
         results = m.search(**kwargs)
         if isinstance(results, dict):
+            items = results.get("results", [])
+            results["results"] = _apply_freshness(items)
+            _track_access(m, [i.get("id") for i in results["results"] if i.get("id")])
             return results
-        return {"results": results if isinstance(results, list) else []}
+        # List response
+        items = results if isinstance(results, list) else []
+        items = _apply_freshness(items)
+        _track_access(m, [i.get("id") for i in items if i.get("id")])
+        return {"results": items}
     except Exception as e:
         logger.error("search_memory error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -351,6 +564,10 @@ def update_memory(
     m = _get_memory()
     try:
         result = m.update(memory_id, data=req.data)
+        _dispatch_webhook("memory.updated", {
+            "memory_id": memory_id,
+            "new_content": req.data[:500],
+        })
         return result
     except Exception as e:
         logger.error("update_memory error: %s", e)
@@ -364,6 +581,7 @@ def delete_memory(memory_id: str, authorization: str = Header("")):
     m = _get_memory()
     try:
         m.delete(memory_id)
+        _dispatch_webhook("memory.deleted", {"memory_id": memory_id})
         return {"status": "deleted"}
     except Exception as e:
         logger.error("delete_memory error: %s", e)
@@ -473,9 +691,456 @@ def get_relations(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── Cross-Project Graph Search ───
+
+class CrossProjectSearchRequest(BaseModel):
+    query: str
+    user_id: str = ""
+    limit: int = 10
+
+
+@app.post("/v1/search/cross-project")
+def search_cross_project(req: CrossProjectSearchRequest, authorization: str = Header("")):
+    """Find how entities from current project connect to other projects.
+
+    Searches the Neo4j graph for entities that appear in multiple projects,
+    then returns their cross-project relationships.
+    """
+    _check_auth(authorization)
+    if not NEO4J_URI:
+        raise HTTPException(
+            status_code=501,
+            detail="Graph memory not enabled (NEO4J_URI not configured)",
+        )
+    m = _get_memory()
+    try:
+        current_project = req.user_id
+
+        # Step 1: Find entities relevant to the query in current project
+        search_results = m.search(
+            query=req.query, user_id=current_project, limit=5,
+        )
+        search_items = (
+            search_results.get("results", [])
+            if isinstance(search_results, dict)
+            else search_results
+        )
+
+        # Step 2: Get all graph data for current project
+        filters = {"user_id": current_project} if current_project else {}
+        graph_data = m.graph.get_all(filters=filters)
+
+        # Collect entity names from current project
+        project_entities = set()
+        if isinstance(graph_data, list):
+            for item in graph_data:
+                src = item.get("source", "")
+                tgt = item.get("target", "")
+                if src:
+                    project_entities.add(src.lower())
+                if tgt:
+                    project_entities.add(tgt.lower())
+
+        # Step 3: Search other projects for same entities
+        # Get stats to find all project IDs
+        all_memories = m.get_all()
+        other_projects = set()
+        for mem in all_memories.get("results", []):
+            uid = mem.get("user_id", "")
+            if uid and uid != current_project:
+                other_projects.add(uid)
+
+        cross_relations = []
+        for other_project in other_projects:
+            try:
+                other_filters = {"user_id": other_project}
+                other_graph = m.graph.get_all(filters=other_filters)
+                if not isinstance(other_graph, list):
+                    continue
+
+                for item in other_graph:
+                    src = item.get("source", "")
+                    tgt = item.get("target", "")
+                    rel = item.get("relation", item.get("relationship", ""))
+
+                    # Check if any entity from current project appears here
+                    src_match = src.lower() in project_entities
+                    tgt_match = tgt.lower() in project_entities
+
+                    if src_match or tgt_match:
+                        cross_relations.append({
+                            "entity": src if src_match else tgt,
+                            "relation": rel,
+                            "connected_to": tgt if src_match else src,
+                            "other_project": other_project,
+                            "direction": "outgoing" if src_match else "incoming",
+                        })
+
+                    if len(cross_relations) >= req.limit:
+                        break
+            except Exception as pe:
+                logger.debug("Cross-project search skipped %s: %s", other_project, pe)
+
+            if len(cross_relations) >= req.limit:
+                break
+
+        return {
+            "current_project": current_project,
+            "entities_in_project": len(project_entities),
+            "other_projects_checked": len(other_projects),
+            "cross_relations": cross_relations[:req.limit],
+            "search_context": [
+                i.get("memory", "")[:100] for i in search_items[:3]
+            ],
+        }
+    except Exception as e:
+        logger.error("search_cross_project error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════
+# Resource Endpoints (for MCP Resources)
+# ═══════════════════════════════════════════════
+
+
+@app.get("/v1/context/{project_id}")
+def auto_context(project_id: str, authorization: str = Header("")):
+    """Build automatic context for a project — used by MCP Resource at session start."""
+    _check_auth(authorization)
+    m = _get_memory()
+    try:
+        # 1. Recent decisions & architecture memories
+        recent = m.search(
+            query=f"{project_id} decisions architecture conventions",
+            user_id=project_id,
+            limit=5,
+        )
+        recent_items = (
+            recent.get("results", []) if isinstance(recent, dict) else recent
+        )
+        recent_items = _apply_freshness(
+            recent_items if isinstance(recent_items, list) else []
+        )
+
+        # 2. Immutable memories (bug lessons) — always included
+        all_mems = m.get_all(user_id=project_id)
+        all_items = all_mems.get("results", []) if isinstance(all_mems, dict) else []
+        immutable_items = [
+            mem for mem in all_items
+            if mem.get("metadata", {}).get("immutable") is True
+        ]
+
+        # 3. Graph relations summary (if enabled)
+        graph_relations = []
+        if graph_enabled:
+            try:
+                filters = {"user_id": project_id}
+                graph_data = m.graph.get_all(filters=filters)
+                if isinstance(graph_data, list):
+                    graph_relations = [
+                        {
+                            "source": item.get("source", ""),
+                            "relation": item.get("relation", ""),
+                            "target": item.get("target", ""),
+                        }
+                        for item in graph_data[:15]  # Cap at 15 relations
+                    ]
+            except Exception as ge:
+                logger.warning("Graph context fetch failed: %s", ge)
+
+        return {
+            "project": project_id,
+            "recent_decisions": [
+                {
+                    "memory": r.get("memory", ""),
+                    "domain": r.get("metadata", {}).get("domain", ""),
+                    "type": r.get("metadata", {}).get("type", ""),
+                    "freshness": r.get("freshness"),
+                }
+                for r in recent_items[:5]
+            ],
+            "immutable_lessons": [
+                {
+                    "memory": im.get("memory", ""),
+                    "domain": im.get("metadata", {}).get("domain", ""),
+                }
+                for im in immutable_items
+            ],
+            "graph_relations": graph_relations,
+            "stats": {
+                "total_memories": len(all_items),
+                "immutable_count": len(immutable_items),
+                "graph_relations_count": len(graph_relations),
+            },
+        }
+    except Exception as e:
+        logger.error("auto_context error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/resources/summary/{project_id}")
+def project_summary(project_id: str, authorization: str = Header("")):
+    """Project memory summary — domain distribution and key decisions."""
+    _check_auth(authorization)
+    m = _get_memory()
+    try:
+        all_mems = m.get_all(user_id=project_id)
+        all_items = all_mems.get("results", []) if isinstance(all_mems, dict) else []
+
+        # Group by domain
+        domains: dict[str, int] = {}
+        for mem in all_items:
+            domain = mem.get("metadata", {}).get("domain", "uncategorized")
+            domains[domain] = domains.get(domain, 0) + 1
+
+        # Key decisions
+        decisions = [
+            mem.get("memory", "")[:200]
+            for mem in all_items
+            if mem.get("metadata", {}).get("type") == "decision"
+        ][:10]
+
+        # Last updated
+        timestamps = [
+            mem.get("updated_at", mem.get("created_at", ""))
+            for mem in all_items
+            if mem.get("updated_at") or mem.get("created_at")
+        ]
+        last_updated = max(timestamps) if timestamps else "unknown"
+
+        return {
+            "project": project_id,
+            "total_memories": len(all_items),
+            "domains": domains,
+            "key_decisions": decisions,
+            "last_updated": last_updated,
+        }
+    except Exception as e:
+        logger.error("project_summary error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/resources/graph-summary/{project_id}")
+def graph_summary(project_id: str, authorization: str = Header("")):
+    """Knowledge graph summary — entities and relations overview."""
+    _check_auth(authorization)
+    if not NEO4J_URI:
+        return {"project": project_id, "error": "Graph not enabled"}
+    m = _get_memory()
+    try:
+        filters = {"user_id": project_id} if project_id else {}
+        graph_data = m.graph.get_all(filters=filters)
+
+        entities: dict[str, list[str]] = {}
+        relations = []
+        if isinstance(graph_data, list):
+            for item in graph_data:
+                src = item.get("source", "")
+                src_type = item.get("source_type", "entity")
+                tgt = item.get("target", "")
+                tgt_type = item.get("target_type", "entity")
+                if src:
+                    entities.setdefault(src_type, []).append(src)
+                if tgt:
+                    entities.setdefault(tgt_type, []).append(tgt)
+                relations.append({
+                    "source": src,
+                    "relation": item.get("relation", ""),
+                    "target": tgt,
+                })
+
+        # Deduplicate entity lists
+        entities = {k: sorted(set(v)) for k, v in entities.items()}
+
+        return {
+            "project": project_id,
+            "entity_types": {k: len(v) for k, v in entities.items()},
+            "entities": entities,
+            "relations": relations[:50],
+            "total_relations": len(relations),
+        }
+    except Exception as e:
+        logger.error("graph_summary error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ═══════════════════════════════════════════════
 # Admin Endpoints
 # ═══════════════════════════════════════════════
+
+
+class CompactRequest(BaseModel):
+    user_id: str = ""
+    dry_run: bool = True
+    min_cluster_size: int = 3
+    similarity_threshold: float = 0.85
+
+
+def _summarize_cluster(memories: list[dict]) -> str:
+    """Merge a cluster of similar memories into one using LLM."""
+    from openai import AzureOpenAI as _AzureOpenAI
+
+    az_client = _AzureOpenAI(
+        api_key=AZURE_OPENAI_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        azure_deployment="gpt-4o-mini",
+        api_version="2024-02-01",
+    )
+
+    contents = "\n".join(f"- {m.get('memory', '')}" for m in memories)
+
+    response = az_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a knowledge compactor. Merge the following related memories "
+                    "into a single, concise memory that preserves ALL important information. "
+                    "Do not lose any decisions, trade-offs, or technical details. "
+                    "Output only the merged memory text, nothing else."
+                ),
+            },
+            {"role": "user", "content": f"Memories to merge:\n{contents}"},
+        ],
+        max_tokens=500,
+        temperature=0.1,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _cluster_by_similarity(
+    m, memories: list[dict], threshold: float,
+) -> list[list[dict]]:
+    """Group memories into clusters by semantic similarity."""
+    used = set()
+    clusters = []
+
+    for i, mem_a in enumerate(memories):
+        if i in used:
+            continue
+        cluster = [mem_a]
+        used.add(i)
+
+        for j, mem_b in enumerate(memories):
+            if j in used:
+                continue
+            # Use semantic search to check similarity
+            try:
+                results = m.search(
+                    query=mem_b.get("memory", ""),
+                    user_id=mem_a.get("user_id", ""),
+                    limit=1,
+                    filters={"id": mem_a.get("id", "")},
+                )
+                # Fallback: compare via direct search score
+                items = results.get("results", []) if isinstance(results, dict) else results
+                if items and items[0].get("score", 0) >= threshold:
+                    cluster.append(mem_b)
+                    used.add(j)
+            except Exception:
+                # Fallback: simple text overlap
+                a_words = set(mem_a.get("memory", "").lower().split())
+                b_words = set(mem_b.get("memory", "").lower().split())
+                if a_words and b_words:
+                    overlap = len(a_words & b_words) / max(len(a_words | b_words), 1)
+                    if overlap >= threshold:
+                        cluster.append(mem_b)
+                        used.add(j)
+
+        clusters.append(cluster)
+
+    return clusters
+
+
+@app.post("/admin/compact")
+def compact_memories(req: CompactRequest, authorization: str = Header("")):
+    """Compact similar memories within domain+type groups.
+
+    dry_run=True shows the plan without applying. dry_run=False merges memories.
+    """
+    _check_auth(authorization)
+    m = _get_memory()
+    try:
+        uid = req.user_id
+        all_mems = m.get_all(user_id=uid).get("results", []) if uid else m.get_all().get("results", [])
+
+        # Group by domain+type
+        groups: dict[str, list[dict]] = {}
+        for mem in all_mems:
+            meta = mem.get("metadata", {})
+            # Skip immutable memories
+            if meta.get("immutable"):
+                continue
+            key = f"{meta.get('domain', 'unknown')}:{meta.get('type', 'unknown')}"
+            groups.setdefault(key, []).append(mem)
+
+        compaction_plan = []
+        total_merged = 0
+        total_saved = 0
+
+        for key, mems in groups.items():
+            if len(mems) < req.min_cluster_size:
+                continue
+
+            clusters = _cluster_by_similarity(m, mems, req.similarity_threshold)
+
+            for cluster in clusters:
+                if len(cluster) < req.min_cluster_size:
+                    continue
+
+                if req.dry_run:
+                    compaction_plan.append({
+                        "group": key,
+                        "memories_to_merge": len(cluster),
+                        "preview": [c.get("memory", "")[:100] for c in cluster],
+                    })
+                else:
+                    # LLM summarize
+                    summary = _summarize_cluster(cluster)
+                    domain, mtype = key.split(":", 1)
+                    merged_ids = [c.get("id") for c in cluster if c.get("id")]
+
+                    # Add compacted memory
+                    m.add(
+                        summary,
+                        user_id=uid or cluster[0].get("user_id", ""),
+                        metadata={
+                            "domain": domain,
+                            "type": mtype,
+                            "source": "compaction",
+                            "merged_count": len(cluster),
+                            "merged_ids": merged_ids,
+                        },
+                    )
+
+                    # Delete originals
+                    for c in cluster:
+                        cid = c.get("id")
+                        if cid:
+                            try:
+                                m.delete(cid)
+                            except Exception:
+                                pass
+
+                    total_merged += len(cluster)
+                    total_saved += len(cluster) - 1
+                    compaction_plan.append({
+                        "group": key,
+                        "merged": len(cluster),
+                        "into_summary": summary[:200],
+                    })
+
+        return {
+            "dry_run": req.dry_run,
+            "plan": compaction_plan,
+            "total_groups_analyzed": len(groups),
+            "total_merged": total_merged,
+            "memories_saved": total_saved,
+        }
+    except Exception as e:
+        logger.error("compact_memories error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/admin/reset-graph")
