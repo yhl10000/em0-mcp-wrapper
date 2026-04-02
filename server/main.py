@@ -350,9 +350,10 @@ def stats(authorization: str = Header("")):
             schema_info.setdefault(key, {"schema": sname, "table": tname, "columns": []})
             schema_info[key]["columns"].append(cname)
 
-        # Find tables that have a user_id column
-        rows = []
         debug_tables = list(schema_info.keys())
+
+        # Strategy 1: Find tables with user_id column
+        rows = []
         for key, info in schema_info.items():
             if "user_id" in info["columns"]:
                 try:
@@ -361,10 +362,24 @@ def stats(authorization: str = Header("")):
                         f"WHERE user_id IS NOT NULL "
                         f"GROUP BY user_id ORDER BY COUNT(*) DESC"
                     )
-                    table_rows = cur.fetchall()
-                    rows.extend(table_rows)
+                    rows.extend(cur.fetchall())
                 except Exception:
                     conn.rollback()
+
+        # Strategy 2: mem0 stores user_id in metadata JSON column
+        if not rows:
+            for key, info in schema_info.items():
+                if "metadata" in info["columns"]:
+                    try:
+                        cur.execute(
+                            f"SELECT metadata->>'user_id' AS uid, COUNT(*) "
+                            f'FROM "{info["schema"]}"."{info["table"]}" '
+                            f"WHERE metadata->>'user_id' IS NOT NULL "
+                            f"GROUP BY metadata->>'user_id' ORDER BY COUNT(*) DESC"
+                        )
+                        rows.extend(cur.fetchall())
+                    except Exception:
+                        conn.rollback()
 
         cur.close()
         conn.close()
