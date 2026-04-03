@@ -1258,7 +1258,9 @@ def compact_memories(req: CompactRequest, authorization: str = Header("")):
                         "preview": [c.get("memory", "")[:100] for c in cluster],
                     })
                 else:
-                    # LLM summarize
+                    # LLM summarize (with rate limit protection)
+                    if total_merged > 0:
+                        time.sleep(3)  # Avoid Azure OpenAI 429
                     summary = _summarize_cluster(cluster)
                     domain, mtype = key.split(":", 1)
                     merged_ids = [c.get("id") for c in cluster if c.get("id")]
