@@ -522,12 +522,25 @@ class SearchAllRequest(BaseModel):
     limit: int = 5
 
 
+def _keyword_relevance(query: str, memory_text: str) -> float:
+    """Score how well memory text matches query keywords (0.0 to 1.0)."""
+    query_words = set(query.lower().split())
+    # Remove very short / stop words
+    query_words = {w for w in query_words if len(w) > 2}
+    if not query_words:
+        return 0.5  # Can't determine, neutral
+
+    memory_lower = memory_text.lower()
+    matches = sum(1 for w in query_words if w in memory_lower)
+    return matches / len(query_words)
+
+
 @app.post("/v1/memories/search-all/")
 def search_all_projects(req: SearchAllRequest, authorization: str = Header("")):
     """Search across ALL projects — no user_id needed.
 
     Discovers all known user_ids from Neo4j graph, then searches each project.
-    Returns aggregated results sorted by score.
+    Returns aggregated results ranked by relevance (keyword match + semantic + freshness).
     """
     _check_auth(authorization)
     m = _get_memory()
@@ -559,12 +572,18 @@ def search_all_projects(req: SearchAllRequest, authorization: str = Header("")):
             "pallasite", "seklabs",
         ])
 
-        # Search each project
+        # Search each project (limit=3 per project to reduce noise)
+        per_project_limit = min(req.limit, 3)
         all_results = []
         for uid in user_ids:
             try:
-                results = m.search(query=req.query, user_id=uid, limit=req.limit)
-                items = results.get("results", []) if isinstance(results, dict) else results
+                results = m.search(
+                    query=req.query, user_id=uid, limit=per_project_limit,
+                )
+                items = (
+                    results.get("results", [])
+                    if isinstance(results, dict) else results
+                )
                 if isinstance(items, list):
                     for item in items:
                         item["_project"] = uid
@@ -572,17 +591,41 @@ def search_all_projects(req: SearchAllRequest, authorization: str = Header("")):
             except Exception:
                 pass
 
-        # Sort by score descending, take top N
-        all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-        top_results = all_results[:req.limit]
+        # Score with keyword relevance boost
+        for item in all_results:
+            memory_text = item.get("memory", "")
+            semantic = item.get("score", 0)
+            keyword_rel = _keyword_relevance(req.query, memory_text)
 
-        # Apply freshness scoring
+            # Combined score: semantic matters, but keyword match is king
+            # keyword_rel=1.0 → full boost, keyword_rel=0.0 → heavy penalty
+            item["_keyword_relevance"] = round(keyword_rel, 2)
+            item["_combined_score"] = round(
+                semantic * (0.3 + 0.7 * keyword_rel), 4
+            )
+
+        # Sort by combined score, filter out zero-keyword matches
+        all_results.sort(
+            key=lambda x: x.get("_combined_score", 0), reverse=True,
+        )
+
+        # Only keep results with at least some keyword relevance
+        relevant = [
+            r for r in all_results if r.get("_keyword_relevance", 0) > 0
+        ]
+        # If nothing matches keywords, fall back to semantic-only top results
+        if not relevant:
+            relevant = all_results
+
+        top_results = relevant[:req.limit]
+
+        # Apply freshness scoring on top results
         top_results = _apply_freshness(top_results)
 
         return {
             "query": req.query,
             "projects_searched": len(user_ids),
-            "total_matches": len(all_results),
+            "total_matches": len(relevant),
             "results": top_results,
         }
     except Exception as e:

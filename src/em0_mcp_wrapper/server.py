@@ -229,14 +229,19 @@ async def search_all_projects(
         project = m.get("_project", m.get("user_id", "?"))
         domain = meta.get("domain", "?")
         mtype = meta.get("type", "?")
-        final = m.get("final_score")
         semantic = m.get("score", 0)
+        keyword_rel = m.get("_keyword_relevance")
+        combined = m.get("_combined_score")
+        final = m.get("final_score")
         freshness = m.get("freshness")
-        score_str = (
-            f"score={final:.2f} (semantic={semantic:.2f}, fresh={freshness})"
-            if final is not None and freshness is not None
-            else f"score={semantic:.2f}"
-        )
+
+        if combined is not None and keyword_rel is not None:
+            score_str = f"relevance={combined:.2f} (keyword={keyword_rel}, semantic={semantic:.2f})"
+        elif final is not None and freshness is not None:
+            score_str = f"score={final:.2f} (semantic={semantic:.2f}, fresh={freshness})"
+        else:
+            score_str = f"score={semantic:.2f}"
+
         lines.append(
             f"{i}. [{project}] [{domain}/{mtype}] {m.get('memory', '')}\n"
             f"   {score_str} | id={m.get('id', '?')}"
