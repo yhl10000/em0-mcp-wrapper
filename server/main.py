@@ -270,22 +270,43 @@ def _dispatch_webhook(event: str, payload: dict):
     def _send():
         import json as _json
 
-        body = _json.dumps({
+        raw_payload = {
             "event": event,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": payload,
-        })
+        }
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if WEBHOOK_SECRET:
+            raw_body = _json.dumps(raw_payload)
             sig = hmac.new(
-                WEBHOOK_SECRET.encode(), body.encode(), hashlib.sha256,
+                WEBHOOK_SECRET.encode(), raw_body.encode(), hashlib.sha256,
             ).hexdigest()
             headers["X-Signature-256"] = f"sha256={sig}"
 
         for url in WEBHOOK_URLS:
             try:
                 import httpx as _httpx
+
+                # Slack needs {"text": "..."} format
+                if "hooks.slack.com" in url:
+                    emoji = {
+                        "memory.created": ":brain:",
+                        "memory.updated": ":pencil2:",
+                        "memory.deleted": ":wastebasket:",
+                        "memory.conflict": ":warning:",
+                    }.get(event, ":pushpin:")
+                    project = payload.get("user_id", "?")
+                    domain = payload.get("domain", "")
+                    mtype = payload.get("type", "")
+                    content = payload.get("content", payload.get("new_content", "?"))
+                    tag = f"[{domain}/{mtype}]" if domain else ""
+                    body = _json.dumps({
+                        "text": f"{emoji} *{event}* | {project} {tag}\n>{content[:300]}"
+                    })
+                else:
+                    body = _json.dumps(raw_payload)
+
                 with _httpx.Client(timeout=10) as c:
                     resp = c.post(url, content=body, headers=headers)
                     logger.info("Webhook %s → %s: %d", event, url[:50], resp.status_code)
