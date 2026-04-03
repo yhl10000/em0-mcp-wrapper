@@ -1,5 +1,7 @@
 # Spec 03: Conflict Detection
 
+**Durum: ✅ TAMAMLANDI** | Impl: v0.5.0 | Deploy: v51+
+
 ## Problem
 Birbirine çelişen kararlar birikebilir. Örneğin:
 - Hafıza A: "Auth için JWT kullanıyoruz"
@@ -8,124 +10,73 @@ Birbirine çelişen kararlar birikebilir. Örneğin:
 İkisi de sistemde kalır, hangi kararın güncel olduğu belirsizdir.
 
 ## Çözüm
-`add_memory` sırasında otomatik semantic search. Yüksek benzerlikli ama farklı içerikli hafıza varsa uyarı dön, güncelleme öner.
+`add_memory` sırasında otomatik semantic search. Yüksek benzerlikli ama farklı içerikli hafıza varsa uyarı dön. Non-blocking — hafıza yine kaydedilir, sadece uyarı verilir.
 
 ## Akış
 ```
 add_memory("MongoDB'ye geçiyoruz") çağrılır
     ↓
-Otomatik semantic search → "PostgreSQL kullanıyoruz" bulunur (score: 0.87)
+_check_conflicts() → semantic search (limit=3, threshold=0.80)
+    ↓
+"PostgreSQL kullanıyoruz" bulunur (score: 0.87)
     ↓
 İçerik farklı + score yüksek = potansiyel çelişki
     ↓
-Response'a uyarı eklenir:
-  "⚠ Conflict: Existing memory says 'PostgreSQL kullanıyoruz' (id: abc123).
-   Consider updating that memory instead, or mark it as superseded."
+Hafıza kaydedilir + response'a conflict uyarısı eklenir
     ↓
-Hafıza yine kaydedilir (bloklama yok), sadece uyarı
+Webhook: memory.conflict event gönderilir (Spec 07)
 ```
 
-## Teknik Detay
+## Implementasyon
 
-### Server tarafı (server/main.py)
+### Helpers — `server/main.py:400-444`
 ```python
-def _check_conflicts(
-    m, content: str, user_id: str, threshold: float = 0.80
-) -> list[dict]:
-    """Yeni içerikle çelişebilecek mevcut hafızaları bul."""
-    try:
-        results = m.search(query=content, user_id=user_id, limit=3)
-        items = results.get("results", []) if isinstance(results, dict) else results
-
-        conflicts = []
-        for item in items:
-            score = item.get("score", 0)
-            existing = item.get("memory", "")
-
-            if score < threshold:
-                continue
-
-            # Aynı içerikse çelişki değil (dedup)
-            if _normalize(content) == _normalize(existing):
-                continue
-
-            # Yüksek benzerlik + farklı içerik = potansiyel çelişki
-            conflicts.append({
-                "existing_memory": existing,
-                "existing_id": item.get("id", "?"),
-                "similarity_score": round(score, 3),
-                "suggestion": "Consider updating this memory or marking as superseded.",
-            })
-
-        return conflicts
-    except Exception as e:
-        logger.warning("Conflict check failed (non-blocking): %s", e)
-        return []
-
-
-def _normalize(text: str) -> str:
-    """Basit normalizasyon — karşılaştırma için."""
-    return " ".join(text.lower().split())
-
-
-# add_memory endpoint'inde:
-@app.post("/v1/memories/")
-def add_memory(req: AddMemoryRequest, authorization: str = Header("")):
-    _check_auth(authorization)
-    m = _get_memory()
-
-    content = req.messages[0]["content"] if req.messages else ""
-
-    # Conflict detection (non-blocking)
-    conflicts = _check_conflicts(m, content, req.user_id)
-
-    # Normal add işlemi (mevcut kod)
-    result = m.add(content, user_id=req.user_id, metadata=req.metadata)
-
-    # Çelişki varsa response'a ekle
-    if conflicts:
-        if isinstance(result, dict):
-            result["conflicts"] = conflicts
-            result["conflict_warning"] = (
-                f"⚠ {len(conflicts)} potential conflict(s) found. "
-                "Review existing memories before proceeding."
-            )
-        
-    return result
+_normalize_text(text: str) -> str          # Lowercase + whitespace normalize
+_check_conflicts(m, content, user_id, threshold=0.80) -> list[dict]
 ```
 
-### MCP Wrapper tarafı (server.py)
-```python
-# add_memory fonksiyonunda mevcut response formatting'e ek:
-if "conflicts" in result:
-    lines = ["\n⚠ POTENTIAL CONFLICTS:"]
-    for c in result["conflicts"]:
-        lines.append(
-            f"  - Existing: \"{c['existing_memory'][:100]}...\""
-            f"\n    id={c['existing_id']} score={c['similarity_score']}"
-            f"\n    → {c['suggestion']}"
-        )
-    # Response'un sonuna ekle
+Logic:
+1. `m.search(query=content, user_id=user_id, limit=3)` çağrılır
+2. Her sonuç için:
+   - `score < threshold` → atla
+   - Normalize edilmiş içerik aynı → dedup, atla
+   - Farklı içerik + yüksek score → **conflict**
+   - Immutable hafızayla çelişki → **extra warning**
+
+### add_memory Entegrasyonu — `server/main.py:466-498`
+- Conflict check `m.add()` çağrısından **önce** yapılır
+- Conflict bulunursa response'a `conflicts` ve `conflict_warning` eklenir
+- `memory.conflict` webhook event'i tetiklenir (Spec 07)
+
+### MCP Tool Formatting — `server.py:97-109`
 ```
+POTENTIAL CONFLICTS:
+  - Existing: "PostgreSQL kullanıyoruz"
+    id=abc123 similarity=0.870
+    -> Consider updating this memory instead.
+```
+Immutable çelişki:
+```
+    -> IMMUTABLE memory — cannot be updated. Verify this new information is correct.
+```
+
+### Config
+```bash
+CONFLICT_THRESHOLD=0.80  # env variable, default 0.80
+```
+
+### Testler — `test_server.py`
+- `test_conflict_detected_high_similarity` — Yüksek benzerlik = conflict
+- `test_conflict_not_detected_low_similarity` — Düşük benzerlik = no conflict
+- `test_conflict_dedup_same_content` — Aynı içerik = dedup, not conflict
+- `test_conflict_immutable_extra_warning` — Immutable ile çelişki = extra warning
+- `test_conflict_multiple_matches` — Birden fazla çelişki
+- `test_conflict_threshold_boundary` — Tam threshold sınırı (0.80 dahil, 0.79 hariç)
 
 ## Maliyet Etkisi
-| Kaynak | Birim Maliyet | add_memory Başına | Aylık (günde 10 add) |
-|--------|--------------|-------------------|---------------------|
-| Embedding search | $0.02/1M token | ~200 token = $0.000004 | $0.001 |
-| **Toplam** | | | **~$0.001/ay** |
-
-**Ekstra maliyet: Sıfıra yakın.** Her add_memory'de 1 search çağrısı.
-
-## Uygulama Adımları
-1. `server/main.py` → `_check_conflicts()` helper
-2. `server/main.py` → `add_memory` endpoint'ine conflict check ekle
-3. `src/em0_mcp_wrapper/server.py` → response formatting güncelle
-4. Test: çelişen hafıza ekleme senaryosu
+| Kaynak | add_memory Başına | Aylık (günde 10 add) |
+|--------|-------------------|---------------------|
+| Embedding search | ~200 token = $0.000004 | ~$0.001 |
 
 ## Bağımlılıklar
-- Yok (mevcut search altyapısını kullanıyor)
-
-## Edge Cases
-- Immutable hafızalarla çelişki → ekstra uyarı: "This conflicts with an IMMUTABLE memory"
-- Aynı session'da ardışık add → kendi eklediğiyle çelişki false positive olabilir
-- threshold çok düşükse gürültü artar, çok yüksekse kaçırır → 0.80 başlangıç, config'e al
+- Spec 07 (Webhooks) — `memory.conflict` event

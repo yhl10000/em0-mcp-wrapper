@@ -1,11 +1,13 @@
 # Spec 01: Auto-Context MCP Resource
 
+**Durum: ✅ TAMAMLANDI** | Impl: v0.5.0 | Deploy: v51+
+
 ## Problem
 em0'dan bilgi çekmek için her session'da manuel olarak `search_memory` çağırmak gerekiyor.
-Obsidian yaklaşımı tüm dosyaları yüklüyor (token israfı), biz sadece ilgili olanları çekeceğiz.
+Obsidian yaklaşımı tüm dosyaları yüklüyor (token israfı), biz sadece ilgili olanları çekiyoruz.
 
 ## Çözüm
-MCP Resource olarak `memory://context/auto` endpoint'i. Session başında Claude Code (veya herhangi bir MCP client) bu resource'u okur, server tarafında akıllı sorgu oluşturur, sadece ilgili 5-10 hafızayı döner.
+MCP Resource olarak `memory://context/{project_id}` endpoint'i. Session başında Claude Code (veya herhangi bir MCP client) bu resource'u okur, server tarafında akıllı sorgu oluşturur, sadece ilgili 5-10 hafızayı döner.
 
 ## Akış
 ```
@@ -14,83 +16,70 @@ Client session başlar
 MCP Resource okur: memory://context/{project_id}
     ↓
 Server tarafında:
-  1. project_id'den son eklenen/erişilen memoryleri çek
-  2. Proje bazlı en yüksek scorelu kararları çek
-  3. Immutable (bug lessons) hafızaları her zaman dahil et
+  1. Semantic search → son 5 karar/mimari hafıza (freshness scoring uygulanır)
+  2. get_all → immutable hafızaları filtrele (bug lessons, her zaman dahil)
+  3. Neo4j graph → ilk 15 entity relation (graph etkinse)
   4. Sonuçları markdown formatında döndür
     ↓
 Client context'ine ~500-1000 token enjekte edilir
 ```
 
-## Teknik Detay
+## Implementasyon
 
-### Server tarafı (server/main.py)
-```python
-@app.get("/v1/context/{project_id}")
-def auto_context(project_id: str, authorization: str = Header("")):
-    """Proje için otomatik context oluştur."""
-    _check_auth(authorization)
-    m = _get_memory()
+### Server Endpoint — `server/main.py:930-1002`
+```
+GET /v1/context/{project_id}
+```
+- Semantic search: `m.search(query="{project_id} decisions architecture conventions", user_id=project_id, limit=5)`
+- Freshness scoring: `_apply_freshness()` uygulanır (Spec 04)
+- Immutable filter: `metadata.immutable == True` olanlar her zaman dahil
+- Graph relations: `m.graph.get_all(filters={"user_id": project_id})` ilk 15 relation
+- Graceful degradation: Neo4j kapalıysa graph bölümü atlanır
 
-    # 1. Son 5 karar/mimari hafıza
-    recent = m.search(
-        query=f"{project_id} decisions architecture",
-        user_id=project_id,
-        limit=5,
-    )
-
-    # 2. Immutable hafızalar (bug lessons) — her zaman dahil
-    immutables = m.get_all(user_id=project_id)
-    immutable_items = [
-        mem for mem in immutables.get("results", [])
-        if mem.get("metadata", {}).get("immutable") is True
-    ]
-
-    # 3. Birleştir ve formatla
-    return {
-        "recent_decisions": recent,
-        "immutable_lessons": immutable_items,
-        "project": project_id,
-    }
+Response:
+```json
+{
+  "project": "centauri",
+  "recent_decisions": [...],
+  "immutable_lessons": [...],
+  "graph_relations": [...],
+  "stats": {"total_memories": 100, "immutable_count": 3, "graph_relations_count": 15}
+}
 ```
 
-### MCP Wrapper tarafı (server.py)
-```python
-@mcp.resource("memory://context/{project_id}")
-async def auto_context(project_id: str) -> str:
-    """Session başında otomatik yüklenen proje context'i."""
-    result = await client.request("GET", f"/v1/context/{project_id}")
-    # Markdown formatında döndür
-    lines = [f"# em0 Context: {project_id}\n"]
-
-    decisions = result.get("recent_decisions", {}).get("results", [])
-    if decisions:
-        lines.append("## Son Kararlar")
-        for d in decisions:
-            lines.append(f"- {d.get('memory', '')}")
-
-    immutables = result.get("immutable_lessons", [])
-    if immutables:
-        lines.append("\n## Dikkat (Immutable)")
-        for im in immutables:
-            lines.append(f"- ⚠ {im.get('memory', '')}")
-
-    return "\n".join(lines)
+### MCP Resource — `server.py:628-675`
 ```
+memory://context/{project_id}
+```
+Markdown formatında döner:
+```markdown
+# em0 Context: centauri
+
+*100 memories, 3 immutable, 15 graph relations*
+
+## Recent Decisions
+- [backend/decision] PostgreSQL v15 kullanıyoruz (fresh=0.96)
+
+## Immutable Lessons (always apply)
+- [infra] Embedding'ler 1024d olmalı, monkey-patch gerekli
+
+## Key Relations (15)
+- PostgreSQL --USED_BY--> centauri
+```
+
+### Client — `client.py:164-166`
+```python
+async def get_context(project_id: str) -> dict
+```
+
+### Testler
+- `test_client.py::test_get_context` — Response formatı doğrulaması
 
 ## Maliyet Etkisi
-| Kaynak | Birim Maliyet | Session Başına | Aylık (30 session/gün) |
-|--------|--------------|----------------|----------------------|
-| Embedding search | $0.02/1M token | ~500 token = $0.00001 | $0.009 |
-| **Toplam** | | | **~$0.01/ay** |
-
-**Ekstra maliyet: Yok denecek kadar az.** Zaten var olan search endpoint'ini çağırıyor.
-
-## Uygulama Adımları
-1. `server/main.py` → `/v1/context/{project_id}` endpoint ekle
-2. `src/em0_mcp_wrapper/client.py` → `get_context()` fonksiyonu ekle
-3. `src/em0_mcp_wrapper/server.py` → `@mcp.resource()` olarak expose et
-4. Test yaz
+| Kaynak | Session Başına | Aylık (30 session/gün) |
+|--------|----------------|----------------------|
+| Embedding search | ~500 token = $0.00001 | ~$0.01 |
 
 ## Bağımlılıklar
-- Yok (mevcut altyapı yeterli)
+- Spec 04 (Freshness Scoring) — karar sonuçlarına freshness uygulanıyor
+- Neo4j (opsiyonel) — graph relations için
