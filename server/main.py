@@ -1139,8 +1139,8 @@ def graph_summary(project_id: str, authorization: str = Header("")):
 class CompactRequest(BaseModel):
     user_id: str = ""
     dry_run: bool = True
-    min_cluster_size: int = 3
-    similarity_threshold: float = 0.40  # Jaccard word overlap (0.85 was for semantic)
+    min_cluster_size: int = 2
+    similarity_threshold: float = 0.25  # Jaccard word overlap
 
 
 def _summarize_cluster(memories: list[dict]) -> str:
