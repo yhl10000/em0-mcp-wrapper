@@ -62,7 +62,14 @@ if command -v pipx &> /dev/null; then
         echo -e "  Updating existing pipx install..."
         pipx uninstall em0-mcp-wrapper 2>/dev/null || true
     fi
-    if pipx install "$REPO_URL" 2>/dev/null; then
+    # Prefer Python 3.13 (FastMCP has issues with 3.14+)
+    PIPX_PYTHON=""
+    if command -v python3.13 &> /dev/null; then
+        PIPX_PYTHON="--python python3.13"
+    elif command -v python3.12 &> /dev/null; then
+        PIPX_PYTHON="--python python3.12"
+    fi
+    if pipx install $PIPX_PYTHON "$REPO_URL" 2>/dev/null; then
         INSTALLED=true
         echo -e "  ${GREEN}✓${NC} Installed via pipx (latest from git)"
     fi
