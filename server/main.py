@@ -1521,6 +1521,12 @@ def graph_visualizer():
   #filters .label-tag:hover { border-color:#58a6ff; }
   #filters .label-tag.active { border-color:#58a6ff; background:#58a6ff22; }
   #filters .filter-title { font-size:11px; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-right:4px; }
+
+  /* Zoom controls */
+  #zoom-controls { position:fixed; bottom:20px; right:20px; display:flex; flex-direction:column; gap:6px; z-index:9999; }
+  #zoom-controls button { width:40px; height:40px; border-radius:8px; border:1px solid #30363d; background:#161b22; color:#c9d1d9; font-size:20px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.15s; box-shadow:0 2px 8px rgba(0,0,0,0.4); }
+  #zoom-controls button:hover { background:#30363d; border-color:#58a6ff; color:#58a6ff; }
+  #zoom-controls button:active { background:#58a6ff22; }
 </style>
 </head><body>
 
@@ -1540,6 +1546,10 @@ def graph_visualizer():
 
 <div id="main">
   <div id="graph"><div id="loading">Enter API key and press Load</div></div>
+  <div id="zoom-controls">
+    <button onclick="zoomIn()" title="Zoom in">+</button>
+    <button onclick="zoomOut()" title="Zoom out">&minus;</button>
+  </div>
   <div id="sidebar">
     <div class="panel" id="node-detail"></div>
     <div class="panel" id="node-rels"></div>
@@ -1609,7 +1619,7 @@ function renderGraph(data) {
       forceAtlas2Based: { gravitationalConstant: -60, centralGravity: 0.008, springLength: 120, springConstant: 0.02, damping: 0.4 },
       stabilization: { iterations: 300, fit: true }
     },
-    interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true, multiselect: true, navigationButtons: false, keyboard: { enabled: true } },
+    interaction: { hover: true, tooltipDelay: 200, zoomView: false, dragView: true, multiselect: true, navigationButtons: false, keyboard: { enabled: true, bindToWindow: false } },
     layout: { improvedLayout: data.nodes.length < 100 }
   });
 
@@ -1734,6 +1744,17 @@ function applyFilters() {
     })
   };
   renderGraph(filtered);
+}
+
+function zoomIn() {
+  if (!network) return;
+  const scale = network.getScale() * 1.3;
+  network.moveTo({ scale, animation: { duration: 200, easingFunction: 'easeInOutQuad' } });
+}
+function zoomOut() {
+  if (!network) return;
+  const scale = network.getScale() / 1.3;
+  network.moveTo({ scale, animation: { duration: 200, easingFunction: 'easeInOutQuad' } });
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
