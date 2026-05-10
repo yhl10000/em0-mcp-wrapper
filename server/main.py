@@ -20,7 +20,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from scoring import apply_freshness as _apply_freshness
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,50 +196,6 @@ class SearchRequest(BaseModel):
 
 class UpdateMemoryRequest(BaseModel):
     data: str
-
-
-# ─── Freshness Scoring ───
-
-def _apply_freshness(results: list[dict]) -> list[dict]:
-    """Apply temporal decay + popularity scoring to search results."""
-    now = datetime.now(timezone.utc)
-
-    for item in results:
-        meta = item.get("metadata", {})
-        semantic_score = item.get("score", 0)
-
-        # Immutable memories are exempt from decay
-        if meta.get("immutable"):
-            item["final_score"] = semantic_score
-            item["freshness"] = 1.0
-            continue
-
-        # Age calculation
-        last_access = meta.get("last_accessed_at") or item.get("created_at", "")
-        if last_access:
-            try:
-                last_dt = datetime.fromisoformat(
-                    last_access.replace("Z", "+00:00")
-                )
-                age_days = (now - last_dt).days
-            except (ValueError, TypeError):
-                age_days = 180
-        else:
-            age_days = 180
-
-        freshness = max(0.5, 1.0 - (age_days / 365) * 0.5)
-
-        # Popularity bonus — frequently accessed memories are valuable
-        access_count = meta.get("access_count", 0)
-        popularity = min(1.2, 1.0 + access_count * 0.02)
-
-        final_score = semantic_score * freshness * popularity
-        item["final_score"] = round(final_score, 4)
-        item["freshness"] = round(freshness, 3)
-
-    # Re-sort by final_score
-    results.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-    return results
 
 
 def _track_access(m, memory_ids: list[str]):
@@ -1357,7 +1315,6 @@ def reset_graph(authorization: str = Header("")):
             status_code=501,
             detail="Graph memory not enabled (NEO4J_URI not configured)",
         )
-    m = _get_memory()
     try:
         from neo4j import GraphDatabase
         driver = GraphDatabase.driver(
@@ -1381,6 +1338,170 @@ def reset_graph(authorization: str = Header("")):
         }
     except Exception as e:
         logger.error("reset_graph error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/graph-audit")
+def graph_audit(
+    user_id: str = Query(""),
+    duplicate_limit: int = Query(25, ge=1, le=100),
+    authorization: str = Header(""),
+):
+    """Dry-run graph quality audit.
+
+    This endpoint never deletes or mutates graph data. It gives operators a
+    compact view of growth, duplication, isolated nodes, and project-boundary
+    edges before deciding whether cleanup or compaction is needed.
+    """
+    _check_auth(authorization)
+    if not NEO4J_URI:
+        return {
+            "graph_enabled": False,
+            "dry_run": True,
+            "user_id": user_id,
+            "summary": {
+                "nodes": 0,
+                "edges": 0,
+                "isolated_nodes": 0,
+                "self_loops": 0,
+                "cross_project_edges": 0,
+            },
+            "duplicate_entities": [],
+            "relation_types": [],
+            "property_coverage": [],
+            "recommendations": ["Set NEO4J_URI to enable graph audit."],
+        }
+
+    try:
+        from neo4j import GraphDatabase
+
+        driver = GraphDatabase.driver(
+            NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+        )
+        params = {"user_id": user_id, "duplicate_limit": duplicate_limit}
+        with driver.session() as session:
+            node_rows = session.run(
+                """
+                MATCH (n)
+                WHERE $user_id = '' OR n.user_id = $user_id
+                RETURN count(n) AS count
+                """,
+                params,
+            ).data()
+            edge_rows = session.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE $user_id = ''
+                   OR a.user_id = $user_id
+                   OR b.user_id = $user_id
+                RETURN count(r) AS count
+                """,
+                params,
+            ).data()
+            isolated_rows = session.run(
+                """
+                MATCH (n)
+                WHERE ($user_id = '' OR n.user_id = $user_id)
+                  AND NOT (n)--()
+                RETURN count(n) AS count
+                """,
+                params,
+            ).data()
+            self_loop_rows = session.run(
+                """
+                MATCH (n)-[r]->(n)
+                WHERE $user_id = '' OR n.user_id = $user_id
+                RETURN count(r) AS count
+                """,
+                params,
+            ).data()
+            cross_project_rows = session.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE a.user_id IS NOT NULL
+                  AND b.user_id IS NOT NULL
+                  AND a.user_id <> b.user_id
+                  AND ($user_id = '' OR a.user_id = $user_id OR b.user_id = $user_id)
+                RETURN count(r) AS count
+                """,
+                params,
+            ).data()
+            duplicate_entities = session.run(
+                """
+                MATCH (n)
+                WHERE $user_id = '' OR n.user_id = $user_id
+                WITH n, coalesce(n.name, n.id, n.uuid, n.label, n.source, n.target) AS entity_key
+                WHERE entity_key IS NOT NULL
+                WITH toLower(toString(entity_key)) AS key,
+                     labels(n) AS labels,
+                     count(n) AS count,
+                     collect(elementId(n))[0..5] AS sample_node_ids
+                WHERE count > 1
+                RETURN key, labels, count, sample_node_ids
+                ORDER BY count DESC
+                LIMIT $duplicate_limit
+                """,
+                params,
+            ).data()
+            relation_types = session.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE $user_id = ''
+                   OR a.user_id = $user_id
+                   OR b.user_id = $user_id
+                RETURN type(r) AS type, count(r) AS count
+                ORDER BY count DESC
+                LIMIT 50
+                """,
+                params,
+            ).data()
+            property_coverage = session.run(
+                """
+                MATCH (n)
+                WHERE $user_id = '' OR n.user_id = $user_id
+                UNWIND keys(n) AS property
+                RETURN property, count(*) AS count
+                ORDER BY count DESC
+                LIMIT 50
+                """,
+                params,
+            ).data()
+        driver.close()
+
+        def _count(rows: list[dict]) -> int:
+            return int(rows[0].get("count", 0)) if rows else 0
+
+        summary = {
+            "nodes": _count(node_rows),
+            "edges": _count(edge_rows),
+            "isolated_nodes": _count(isolated_rows),
+            "self_loops": _count(self_loop_rows),
+            "cross_project_edges": _count(cross_project_rows),
+        }
+        recommendations = []
+        if duplicate_entities:
+            recommendations.append("Review duplicate_entities before the next compaction run.")
+        if summary["isolated_nodes"]:
+            recommendations.append("Inspect isolated_nodes; they may be stale extraction artifacts.")
+        if summary["self_loops"]:
+            recommendations.append("Inspect self_loops; they often indicate noisy relation extraction.")
+        if not property_coverage:
+            recommendations.append("No node properties found for this scope.")
+        if not recommendations:
+            recommendations.append("No obvious graph hygiene issues detected in this audit.")
+
+        return {
+            "graph_enabled": True,
+            "dry_run": True,
+            "user_id": user_id,
+            "summary": summary,
+            "duplicate_entities": duplicate_entities,
+            "relation_types": relation_types,
+            "property_coverage": property_coverage,
+            "recommendations": recommendations,
+        }
+    except Exception as e:
+        logger.error("graph_audit error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1462,10 +1583,6 @@ def graph_debug(authorization: str = Header("")):
     except Exception as e:
         logger.error("graph_debug error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-from fastapi.responses import HTMLResponse
-
 
 @app.get("/admin/graph", response_class=HTMLResponse)
 def graph_visualizer():

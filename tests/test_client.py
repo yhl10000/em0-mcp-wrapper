@@ -298,6 +298,33 @@ async def test_get_graph_summary():
     assert "Erkut" in result["entities"]["person"]
 
 
+@respx.mock
+@pytest.mark.asyncio
+async def test_audit_graph():
+    route = respx.get("https://test-mem0.example.com/admin/graph-audit")
+    route.mock(return_value=httpx.Response(200, json={
+        "graph_enabled": True,
+        "dry_run": True,
+        "user_id": "myproject",
+        "summary": {
+            "nodes": 10,
+            "edges": 12,
+            "isolated_nodes": 1,
+            "self_loops": 0,
+            "cross_project_edges": 2,
+        },
+        "duplicate_entities": [],
+        "relation_types": [],
+        "property_coverage": [],
+        "recommendations": ["Inspect isolated_nodes."],
+    }))
+    result = await client.audit_graph("myproject", duplicate_limit=10)
+    assert result["dry_run"] is True
+    assert result["summary"]["isolated_nodes"] == 1
+    assert route.calls[0].request.url.params["user_id"] == "myproject"
+    assert route.calls[0].request.url.params["duplicate_limit"] == "10"
+
+
 # ─── Compaction Client Tests ───
 
 
@@ -367,7 +394,12 @@ async def test_compact_memories_dry_run():
                 {
                     "group": "backend:decision",
                     "memories_to_merge": 4,
-                    "preview": ["Use PostgreSQL", "PostgreSQL v15", "DB is PostgreSQL", "Chose PostgreSQL"],
+                    "preview": [
+                        "Use PostgreSQL",
+                        "PostgreSQL v15",
+                        "DB is PostgreSQL",
+                        "Chose PostgreSQL",
+                    ],
                 }
             ],
             "total_groups_analyzed": 5,
@@ -387,7 +419,13 @@ async def test_compact_memories_apply():
     route = respx.post("https://test-mem0.example.com/admin/compact")
     route.mock(return_value=httpx.Response(200, json={
         "dry_run": False,
-        "plan": [{"group": "backend:decision", "merged": 4, "into_summary": "PostgreSQL v15 is the database"}],
+        "plan": [
+            {
+                "group": "backend:decision",
+                "merged": 4,
+                "into_summary": "PostgreSQL v15 is the database",
+            }
+        ],
         "total_groups_analyzed": 5,
         "total_merged": 4,
         "memories_saved": 3,

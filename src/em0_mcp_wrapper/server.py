@@ -367,7 +367,7 @@ async def memory_stats() -> str:
             lines.append(f"  {name}: {count} memories")
     graph = result.get("graph", {})
     if graph:
-        lines.append(f"\nKnowledge Graph:")
+        lines.append("\nKnowledge Graph:")
         lines.append(f"  Nodes: {graph.get('nodes', 0)}")
         lines.append(f"  Edges: {graph.get('edges', 0)}")
     return "\n".join(lines)
@@ -619,6 +619,60 @@ async def compact_memories(
                 )
     else:
         lines.append("No groups eligible for compaction.")
+
+    return "\n".join(lines)
+
+
+# ─── Tool 15: Audit Graph ───
+@mcp.tool()
+async def audit_graph(user_id: str = "", duplicate_limit: int = 25) -> str:
+    """Run a read-only graph quality audit.
+
+    Use this before graph cleanup, compaction, or data-growth investigations.
+    The audit is dry-run only and does not delete or mutate memories.
+
+    Args:
+        user_id: Project scope (empty = default from config)
+        duplicate_limit: Maximum duplicate entity groups to return (default: 25)
+    """
+    uid = user_id or config.DEFAULT_USER_ID
+    logger.info("audit_graph: user=%s duplicate_limit=%s", uid, duplicate_limit)
+    result = await client.audit_graph(user_id=uid, duplicate_limit=duplicate_limit)
+    if "error" in result:
+        return _dump(result)
+
+    if not result.get("graph_enabled"):
+        return _dump(result)
+
+    summary = result.get("summary", {})
+    lines = [
+        "Graph Audit (dry_run=True, nothing changed):\n",
+        f"Project scope: {result.get('user_id') or 'all'}",
+        f"Nodes: {summary.get('nodes', 0)}",
+        f"Edges: {summary.get('edges', 0)}",
+        f"Isolated nodes: {summary.get('isolated_nodes', 0)}",
+        f"Self-loops: {summary.get('self_loops', 0)}",
+        f"Cross-project edges: {summary.get('cross_project_edges', 0)}",
+    ]
+
+    duplicates = result.get("duplicate_entities", [])
+    if duplicates:
+        lines.append("\nDuplicate entity keys:")
+        for item in duplicates[:duplicate_limit]:
+            labels = ",".join(item.get("labels", [])) or "?"
+            lines.append(f"  - {item.get('key', '?')} [{labels}] x{item.get('count', 0)}")
+
+    relation_types = result.get("relation_types", [])
+    if relation_types:
+        lines.append("\nTop relation types:")
+        for item in relation_types[:10]:
+            lines.append(f"  - {item.get('type', '?')}: {item.get('count', 0)}")
+
+    recommendations = result.get("recommendations", [])
+    if recommendations:
+        lines.append("\nRecommendations:")
+        for rec in recommendations:
+            lines.append(f"  - {rec}")
 
     return "\n".join(lines)
 

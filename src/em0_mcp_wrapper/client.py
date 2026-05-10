@@ -176,6 +176,15 @@ async def get_graph_summary(project_id: str) -> dict:
     return await request("GET", f"/v1/resources/graph-summary/{project_id}")
 
 
+async def audit_graph(user_id: str = "", duplicate_limit: int = 25) -> dict:
+    """Run a read-only graph quality audit."""
+    return await request(
+        "GET",
+        "/admin/graph-audit",
+        params={"user_id": user_id, "duplicate_limit": duplicate_limit},
+    )
+
+
 async def search_all_projects(query: str, limit: int = 5) -> dict:
     """Search across ALL projects — no user_id needed."""
     return await request(

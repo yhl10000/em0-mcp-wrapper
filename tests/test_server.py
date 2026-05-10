@@ -1,12 +1,21 @@
 """Tests for MCP server tool registration and freshness scoring."""
 
+import hashlib
+import hmac
+import importlib.util
+import pathlib
+import sys
 from datetime import datetime, timedelta, timezone
 
 from em0_mcp_wrapper import config
 
-# Set config before importing server
-config.MEM0_API_URL = "https://test-mem0.example.com"
-config.MEM0_API_KEY = "test-key"
+_SCORING_PATH = pathlib.Path(__file__).resolve().parents[1] / "server" / "scoring.py"
+_SCORING_SPEC = importlib.util.spec_from_file_location("em0_server_scoring", _SCORING_PATH)
+assert _SCORING_SPEC is not None
+assert _SCORING_SPEC.loader is not None
+server_scoring = importlib.util.module_from_spec(_SCORING_SPEC)
+sys.modules[_SCORING_SPEC.name] = server_scoring
+_SCORING_SPEC.loader.exec_module(server_scoring)
 
 
 def test_version():
@@ -28,39 +37,8 @@ def test_max_memory_length_default():
 
 
 # ─── Freshness Scoring Tests ───
-from datetime import datetime, timedelta, timezone
 
-
-def _apply_freshness(results: list[dict]) -> list[dict]:
-    """Local copy of server/main.py _apply_freshness for unit testing.
-
-    Kept in sync with the server implementation.
-    """
-    now = datetime.now(timezone.utc)
-    for item in results:
-        meta = item.get("metadata", {})
-        semantic_score = item.get("score", 0)
-        if meta.get("immutable"):
-            item["final_score"] = semantic_score
-            item["freshness"] = 1.0
-            continue
-        last_access = meta.get("last_accessed_at") or item.get("created_at", "")
-        if last_access:
-            try:
-                last_dt = datetime.fromisoformat(last_access.replace("Z", "+00:00"))
-                age_days = (now - last_dt).days
-            except (ValueError, TypeError):
-                age_days = 180
-        else:
-            age_days = 180
-        freshness = max(0.5, 1.0 - (age_days / 365) * 0.5)
-        access_count = meta.get("access_count", 0)
-        popularity = min(1.2, 1.0 + access_count * 0.02)
-        final_score = semantic_score * freshness * popularity
-        item["final_score"] = round(final_score, 4)
-        item["freshness"] = round(freshness, 3)
-    results.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-    return results
+_apply_freshness = server_scoring.apply_freshness
 
 
 def _make_memory(score, days_ago=0, access_count=0, immutable=False):
@@ -272,10 +250,6 @@ def test_conflict_threshold_boundary():
 
 
 # ─── Webhook Dispatcher Tests ───
-
-import hashlib
-import hmac
-import json
 
 
 def test_webhook_dispatch_filters_events():

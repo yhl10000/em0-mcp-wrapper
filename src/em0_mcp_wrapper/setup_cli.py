@@ -121,7 +121,7 @@ def main():
     print("\nDone! Restart Claude Code to use em0.")
     print("Tools: add_memory, search_memory, list_memories, get_memory,")
     print("       update_memory, delete_memory, memory_history, memory_stats,")
-    print("       get_entities, get_relations, search_graph, delete_entity")
+    print("       get_entities, get_relations, search_graph, audit_graph, delete_entity")
 
 
 if __name__ == "__main__":

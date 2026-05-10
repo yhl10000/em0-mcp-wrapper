@@ -6,7 +6,7 @@ Built on [FastMCP 3.x](https://github.com/jlowin/fastmcp). Backed by PostgreSQL 
 
 ## What it does
 
-Provides **15 MCP tools** and **3 MCP resources** to Claude Code — persistent memory across sessions, projects, and team members.
+Provides **16 MCP tools** and **3 MCP resources** to Claude Code — persistent memory across sessions, projects, and team members.
 
 ### Memory Tools
 
@@ -31,6 +31,7 @@ Provides **15 MCP tools** and **3 MCP resources** to Claude Code — persistent 
 | `get_relations` | List all relationships between entities |
 | `search_graph` | Search via relationship traversal ("what depends on X?") |
 | `search_cross_project` | Find entities shared across multiple projects |
+| `audit_graph` | Dry-run graph quality audit for duplicates, isolated nodes, and relation growth |
 | `delete_entity` | Delete an entity and all its relations |
 
 ### MCP Resources (passive context)
