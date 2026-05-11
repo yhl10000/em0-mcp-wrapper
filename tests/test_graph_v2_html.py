@@ -32,6 +32,9 @@ def test_graph_v2_keeps_visualizer_canvas_separate_from_empty_overlay():
     script = html.split("<script>", 1)[1].split("</script>", 1)[0]
 
     assert '<div id="graph"><div id="network"></div><div id="empty">' in html
+    assert "#shell { display:grid; grid-template-columns:minmax(0,1fr) 360px; min-height:0; height:100%; }" in html
+    assert "#graph { position:relative; min-width:0; min-height:0; height:100%; overflow:hidden; }" in html
+    assert "#network { position:absolute; inset:0; width:100%; height:100%; }" in html
     assert "const container = document.getElementById('network');" in script
     assert "new vis.Network(container" in script
     assert "document.getElementById('empty').style" not in script

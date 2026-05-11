@@ -1888,9 +1888,9 @@ def graph_visualizer_v2():
   button.primary:hover { background:#1e8d5e; color:#fff; }
   button.warn { background:#58331a; border-color:#9a5a28; }
   #status { margin-left:auto; color:#8ea0b4; font-size:12px; white-space:nowrap; }
-  #shell { display:grid; grid-template-columns:1fr 360px; min-height:0; }
-  #graph { position:relative; min-width:0; min-height:0; overflow:hidden; }
-  #network { position:absolute; inset:0; }
+  #shell { display:grid; grid-template-columns:minmax(0,1fr) 360px; min-height:0; height:100%; }
+  #graph { position:relative; min-width:0; min-height:0; height:100%; overflow:hidden; }
+  #network { position:absolute; inset:0; width:100%; height:100%; }
   #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8ea0b4; font-size:14px; pointer-events:none; }
   #side { min-width:0; background:#111821; border-left:1px solid #263241; overflow:auto; }
   .panel { padding:14px; border-bottom:1px solid #263241; }
