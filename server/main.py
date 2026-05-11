@@ -1907,7 +1907,7 @@ def graph_visualizer_v2():
   .small { font-size:12px; }
   #audit .row { align-items:flex-start; }
   @media (max-width: 900px) {
-    #shell { grid-template-columns:1fr; grid-template-rows:minmax(0,1fr) 300px; }
+    #shell { grid-template-columns:1fr; grid-template-rows:minmax(320px,1fr) 300px; }
     #side { border-left:none; border-top:1px solid #263241; }
     #apiKey,#project,#search,#labelFilter,#relationFilter { width:calc(50vw - 24px); min-width:150px; }
     #status { margin-left:0; width:100%; }
