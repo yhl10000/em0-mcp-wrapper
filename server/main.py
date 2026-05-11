@@ -1871,9 +1871,10 @@ def graph_visualizer_v2():
 <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 <style>
   * { box-sizing:border-box; }
-  body { margin:0; background:#0b0f14; color:#dbe4ee; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; }
+  html,body { height:100%; }
+  body { margin:0; background:#0b0f14; color:#dbe4ee; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; display:grid; grid-template-rows:auto minmax(0,1fr); }
   button,input,select { font:inherit; }
-  #topbar { height:56px; display:flex; align-items:center; gap:10px; padding:0 14px; background:#111821; border-bottom:1px solid #263241; }
+  #topbar { min-height:56px; display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:10px 14px; background:#111821; border-bottom:1px solid #263241; }
   #brand { font-weight:700; color:#7cc7ff; white-space:nowrap; }
   #topbar input,#topbar select { height:34px; color:#dbe4ee; background:#0b0f14; border:1px solid #2f3f50; border-radius:6px; padding:0 10px; min-width:0; }
   #apiKey { width:190px; }
@@ -1887,7 +1888,7 @@ def graph_visualizer_v2():
   button.primary:hover { background:#1e8d5e; color:#fff; }
   button.warn { background:#58331a; border-color:#9a5a28; }
   #status { margin-left:auto; color:#8ea0b4; font-size:12px; white-space:nowrap; }
-  #shell { display:grid; grid-template-columns:1fr 360px; height:calc(100vh - 56px); min-height:0; }
+  #shell { display:grid; grid-template-columns:1fr 360px; min-height:0; }
   #graph { position:relative; min-width:0; }
   #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8ea0b4; font-size:14px; pointer-events:none; }
   #side { min-width:0; background:#111821; border-left:1px solid #263241; overflow:auto; }
@@ -1905,10 +1906,10 @@ def graph_visualizer_v2():
   .small { font-size:12px; }
   #audit .row { align-items:flex-start; }
   @media (max-width: 900px) {
-    #topbar { flex-wrap:wrap; height:112px; align-content:center; }
-    #shell { grid-template-columns:1fr; grid-template-rows:minmax(0,1fr) 300px; height:calc(100vh - 112px); }
+    #shell { grid-template-columns:1fr; grid-template-rows:minmax(0,1fr) 300px; }
     #side { border-left:none; border-top:1px solid #263241; }
-    #apiKey,#project,#search,#labelFilter,#relationFilter { width:calc(50vw - 24px); }
+    #apiKey,#project,#search,#labelFilter,#relationFilter { width:calc(50vw - 24px); min-width:150px; }
+    #status { margin-left:0; width:100%; }
   }
 </style>
 </head><body>
@@ -1955,7 +1956,7 @@ const groupColors = {};
 let colorIndex = 0;
 
 function apiHeaders() {
-  return { Authorization: 'Bearer ' + document.getElementById('apiKey').value };
+  return { Authorization: 'Bearer ' + document.getElementById('apiKey').value.trim() };
 }
 
 function setStatus(text, cls) {
@@ -1981,6 +1982,12 @@ function queryString(params) {
 }
 
 async function loadSlice() {
+  const key = document.getElementById('apiKey').value.trim();
+  if (!key) {
+    setStatus('API key required', 'error');
+    return;
+  }
+  localStorage.setItem('em0GraphApiKey', key);
   setStatus('loading', '');
   const params = {
     user_id: document.getElementById('project').value.trim(),
@@ -1990,9 +1997,7 @@ async function loadSlice() {
     limit: document.getElementById('limit').value || 300
   };
   try {
-    const res = await fetch('/admin/graph-slice?' + queryString(params), { headers: apiHeaders() });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
+    const data = await fetchJson('/admin/graph-slice?' + queryString(params));
     currentData = { nodes: data.nodes || [], edges: data.edges || [] };
     renderGraph(currentData);
     populateFilters(data.filters || {});
@@ -2101,9 +2106,7 @@ function showNode(id) {
 async function expandNode(id) {
   setStatus('expanding', '');
   try {
-    const res = await fetch('/admin/graph-neighbors/' + encodeURIComponent(id) + '?depth=1&limit=300', { headers: apiHeaders() });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
+    const data = await fetchJson('/admin/graph-neighbors/' + encodeURIComponent(id) + '?depth=1&limit=300');
     mergeGraph(data);
     renderGraph(currentData);
     network.selectNodes([id]);
@@ -2135,9 +2138,7 @@ async function loadPath() {
   const params = queryString({ from_id: selectedPath[0], to_id: selectedPath[1], max_depth: 5 });
   setStatus('path loading', '');
   try {
-    const res = await fetch('/admin/graph-path?' + params, { headers: apiHeaders() });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
+    const data = await fetchJson('/admin/graph-path?' + params);
     if (!data.stats.found) {
       setStatus('path not found', 'error');
       return;
@@ -2160,9 +2161,7 @@ async function runAudit() {
   setStatus('audit loading', '');
   const params = queryString({ user_id: document.getElementById('project').value.trim(), duplicate_limit: 15 });
   try {
-    const res = await fetch('/admin/graph-audit?' + params, { headers: apiHeaders() });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
+    const data = await fetchJson('/admin/graph-audit?' + params);
     renderAudit(data);
     setStatus('audit done', 'ok');
   } catch (err) {
@@ -2193,6 +2192,28 @@ function fitGraph() {
   if (network) network.fit({ animation: { duration: 350, easingFunction: 'easeInOutQuad' } });
 }
 
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: apiHeaders() });
+  if (res.status === 401) throw new Error('API key missing or invalid');
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = body.detail ? ': ' + body.detail : '';
+    } catch (_) {}
+    throw new Error('HTTP ' + res.status + detail);
+  }
+  return res.json();
+}
+
+function initGraphExplorer() {
+  const savedKey = localStorage.getItem('em0GraphApiKey');
+  if (savedKey) document.getElementById('apiKey').value = savedKey;
+  if (typeof vis === 'undefined') {
+    setStatus('graph renderer failed to load', 'error');
+  }
+}
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s == null ? '' : String(s);
@@ -2206,6 +2227,8 @@ function escAttr(s) {
 function jsString(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
+
+initGraphExplorer();
 </script>
 </body></html>"""
 
