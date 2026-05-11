@@ -1872,7 +1872,7 @@ def graph_visualizer_v2():
 <style>
   * { box-sizing:border-box; }
   html,body { height:100%; }
-  body { margin:0; background:#0b0f14; color:#dbe4ee; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; display:grid; grid-template-rows:auto minmax(0,1fr); }
+  body { margin:0; background:#0b0f14; color:#dbe4ee; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; display:flex; flex-direction:column; }
   button,input,select { font:inherit; }
   #topbar { min-height:56px; display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:10px 14px; background:#111821; border-bottom:1px solid #263241; }
   #brand { font-weight:700; color:#7cc7ff; white-space:nowrap; }
@@ -1888,8 +1888,8 @@ def graph_visualizer_v2():
   button.primary:hover { background:#1e8d5e; color:#fff; }
   button.warn { background:#58331a; border-color:#9a5a28; }
   #status { margin-left:auto; color:#8ea0b4; font-size:12px; white-space:nowrap; }
-  #shell { display:grid; grid-template-columns:minmax(0,1fr) 360px; min-height:0; height:100%; }
-  #graph { position:relative; min-width:0; min-height:0; height:100%; overflow:hidden; }
+  #shell { flex:1 1 auto; display:grid; grid-template-columns:minmax(0,1fr) 360px; min-height:0; }
+  #graph { position:relative; min-width:0; min-height:0; overflow:hidden; }
   #network { position:absolute; inset:0; width:100%; height:100%; }
   #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8ea0b4; font-size:14px; pointer-events:none; }
   #side { min-width:0; background:#111821; border-left:1px solid #263241; overflow:auto; }
