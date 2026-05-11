@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from graph_payload import graph_edge_payload, graph_node_payload
 from mem0_compat import search_memory as _mem0_search
 from pydantic import BaseModel
 from scoring import apply_freshness as _apply_freshness
@@ -175,6 +176,18 @@ def _check_auth(authorization: str):
     token = authorization.replace("Bearer ", "") if authorization else ""
     if token != MEM0_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _get_neo4j_driver():
+    """Create a Neo4j driver for admin graph endpoints."""
+    if not NEO4J_URI:
+        raise HTTPException(
+            status_code=501,
+            detail="Graph memory not enabled (NEO4J_URI not configured)",
+        )
+    from neo4j import GraphDatabase
+
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
 
 
 # ─── Request/Response models ───
@@ -1515,20 +1528,275 @@ def graph_audit(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _graph_filter_stats(session, user_id: str) -> dict:
+    label_rows = session.run(
+        """
+        MATCH (n)
+        WHERE $user_id = '' OR n.user_id = $user_id
+        UNWIND labels(n) AS label
+        RETURN label, count(*) AS count
+        ORDER BY count DESC
+        LIMIT 50
+        """,
+        {"user_id": user_id},
+    ).data()
+    relation_rows = session.run(
+        """
+        MATCH (a)-[r]->(b)
+        WHERE $user_id = ''
+           OR a.user_id = $user_id
+           OR b.user_id = $user_id
+        RETURN type(r) AS type, count(r) AS count
+        ORDER BY count DESC
+        LIMIT 50
+        """,
+        {"user_id": user_id},
+    ).data()
+    return {
+        "labels": label_rows,
+        "relations": relation_rows,
+    }
+
+
+def _graph_payload_from_rows(
+    node_rows: list[dict],
+    rel_rows: list[dict],
+) -> dict[str, list[dict]]:
+    nodes = [
+        graph_node_payload(row["id"], row.get("labels"), row.get("props"))
+        for row in node_rows
+    ]
+    edges = [
+        graph_edge_payload(row["source"], row["target"], row["type"], row.get("props"))
+        for row in rel_rows
+    ]
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/admin/graph-slice")
+def graph_slice(
+    user_id: str = Query(""),
+    label: str = Query(""),
+    relation: str = Query(""),
+    q: str = Query(""),
+    limit: int = Query(300, ge=1, le=2000),
+    authorization: str = Header(""),
+):
+    """Return a bounded graph slice for the v2 explorer."""
+    _check_auth(authorization)
+    try:
+        driver = _get_neo4j_driver()
+        params = {
+            "user_id": user_id,
+            "label": label,
+            "relation": relation,
+            "q": q.strip().lower(),
+            "limit": limit,
+            "edge_limit": min(limit * 4, 5000),
+        }
+        with driver.session() as session:
+            node_rows = session.run(
+                """
+                MATCH (n)
+                WHERE ($user_id = '' OR n.user_id = $user_id)
+                  AND ($label = '' OR $label IN labels(n))
+                  AND (
+                    $q = ''
+                    OR toLower(toString(coalesce(n.name, n.id, n.uuid, n.label, n.source, n.target, '')))
+                       CONTAINS $q
+                  )
+                RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props
+                LIMIT $limit
+                """,
+                params,
+            ).data()
+            node_ids = [row["id"] for row in node_rows]
+            rel_rows = []
+            if node_ids:
+                rel_rows = session.run(
+                    """
+                    MATCH (a)-[r]->(b)
+                    WHERE elementId(a) IN $node_ids
+                      AND elementId(b) IN $node_ids
+                      AND ($relation = '' OR type(r) = $relation)
+                    RETURN elementId(a) AS source,
+                           elementId(b) AS target,
+                           type(r) AS type,
+                           properties(r) AS props
+                    LIMIT $edge_limit
+                    """,
+                    {**params, "node_ids": node_ids},
+                ).data()
+            filters = _graph_filter_stats(session, user_id)
+        driver.close()
+
+        payload = _graph_payload_from_rows(node_rows, rel_rows)
+        payload["filters"] = filters
+        payload["stats"] = {
+            "nodes": len(payload["nodes"]),
+            "edges": len(payload["edges"]),
+            "limited": len(payload["nodes"]) >= limit,
+        }
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("graph_slice error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/graph-search")
+def graph_search(
+    q: str = Query(..., min_length=1),
+    user_id: str = Query(""),
+    limit: int = Query(25, ge=1, le=100),
+    authorization: str = Header(""),
+):
+    """Search graph nodes by common identity fields."""
+    _check_auth(authorization)
+    try:
+        driver = _get_neo4j_driver()
+        with driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (n)
+                WHERE ($user_id = '' OR n.user_id = $user_id)
+                  AND toLower(toString(coalesce(n.name, n.id, n.uuid, n.label, n.source, n.target, '')))
+                      CONTAINS $q
+                RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props
+                LIMIT $limit
+                """,
+                {"q": q.strip().lower(), "user_id": user_id, "limit": limit},
+            ).data()
+        driver.close()
+        return {
+            "nodes": [
+                graph_node_payload(row["id"], row.get("labels"), row.get("props"))
+                for row in rows
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("graph_search error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/graph-neighbors/{node_id}")
+def graph_neighbors(
+    node_id: str,
+    depth: int = Query(1, ge=1, le=2),
+    limit: int = Query(250, ge=1, le=1000),
+    authorization: str = Header(""),
+):
+    """Return a node neighborhood, capped for interactive expansion."""
+    _check_auth(authorization)
+    try:
+        driver = _get_neo4j_driver()
+        depth = max(1, min(depth, 2))
+        with driver.session() as session:
+            node_rows = session.run(
+                f"""
+                MATCH (center)
+                WHERE elementId(center) = $node_id
+                MATCH p = (center)-[*1..{depth}]-(n)
+                WITH p LIMIT $limit
+                UNWIND nodes(p) AS node
+                RETURN DISTINCT elementId(node) AS id,
+                       labels(node) AS labels,
+                       properties(node) AS props
+                """,
+                {"node_id": node_id, "limit": limit},
+            ).data()
+            rel_rows = session.run(
+                f"""
+                MATCH (center)
+                WHERE elementId(center) = $node_id
+                MATCH p = (center)-[*1..{depth}]-(n)
+                WITH p LIMIT $limit
+                UNWIND relationships(p) AS rel
+                RETURN DISTINCT elementId(startNode(rel)) AS source,
+                       elementId(endNode(rel)) AS target,
+                       type(rel) AS type,
+                       properties(rel) AS props
+                """,
+                {"node_id": node_id, "limit": limit},
+            ).data()
+        driver.close()
+        payload = _graph_payload_from_rows(node_rows, rel_rows)
+        payload["stats"] = {
+            "nodes": len(payload["nodes"]),
+            "edges": len(payload["edges"]),
+            "depth": depth,
+        }
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("graph_neighbors error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/graph-path")
+def graph_path(
+    from_id: str = Query(...),
+    to_id: str = Query(...),
+    max_depth: int = Query(4, ge=1, le=6),
+    authorization: str = Header(""),
+):
+    """Return the shortest path between two graph nodes."""
+    _check_auth(authorization)
+    try:
+        driver = _get_neo4j_driver()
+        max_depth = max(1, min(max_depth, 6))
+        with driver.session() as session:
+            node_rows = session.run(
+                f"""
+                MATCH (a), (b)
+                WHERE elementId(a) = $from_id AND elementId(b) = $to_id
+                MATCH p = shortestPath((a)-[*1..{max_depth}]-(b))
+                UNWIND nodes(p) AS node
+                RETURN DISTINCT elementId(node) AS id,
+                       labels(node) AS labels,
+                       properties(node) AS props
+                """,
+                {"from_id": from_id, "to_id": to_id},
+            ).data()
+            rel_rows = session.run(
+                f"""
+                MATCH (a), (b)
+                WHERE elementId(a) = $from_id AND elementId(b) = $to_id
+                MATCH p = shortestPath((a)-[*1..{max_depth}]-(b))
+                UNWIND relationships(p) AS rel
+                RETURN DISTINCT elementId(startNode(rel)) AS source,
+                       elementId(endNode(rel)) AS target,
+                       type(rel) AS type,
+                       properties(rel) AS props
+                """,
+                {"from_id": from_id, "to_id": to_id},
+            ).data()
+        driver.close()
+        payload = _graph_payload_from_rows(node_rows, rel_rows)
+        payload["stats"] = {
+            "nodes": len(payload["nodes"]),
+            "edges": len(payload["edges"]),
+            "max_depth": max_depth,
+            "found": bool(payload["nodes"]),
+        }
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("graph_path error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/graph-data")
 def graph_data(authorization: str = Header("")):
     """Return all Neo4j nodes and relationships as JSON for visualization."""
     _check_auth(authorization)
-    if not NEO4J_URI:
-        raise HTTPException(
-            status_code=501,
-            detail="Graph memory not enabled (NEO4J_URI not configured)",
-        )
     try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(
-            NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
-        )
+        driver = _get_neo4j_driver()
         with driver.session() as session:
             # Get all nodes with elementId (Neo4j 5.x)
             nodes_result = session.run(
@@ -1540,20 +1808,18 @@ def graph_data(authorization: str = Header("")):
             ).data()
         driver.close()
 
-        nodes = []
-        for n in nodes_result:
-            label = n["labels"][0] if n["labels"] else "Node"
-            props = n["props"] or {}
-            # Remove embedding vectors from props (too large)
-            props.pop("embedding", None)
-            name = props.get("name", props.get("id", str(n["id"])))
-            nodes.append({"id": n["id"], "label": str(name), "group": label, "properties": props})
-
-        edges = []
-        for r in rels_result:
-            edges.append({"from": r["source"], "to": r["target"], "label": r["type"], "properties": r["props"] or {}})
+        nodes = [
+            graph_node_payload(n["id"], n.get("labels"), n.get("props"))
+            for n in nodes_result
+        ]
+        edges = [
+            graph_edge_payload(r["source"], r["target"], r["type"], r.get("props"))
+            for r in rels_result
+        ]
 
         return {"nodes": nodes, "edges": edges}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("graph_data error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1593,6 +1859,355 @@ def graph_debug(authorization: str = Header("")):
     except Exception as e:
         logger.error("graph_debug error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/graph-v2", response_class=HTMLResponse)
+def graph_visualizer_v2():
+    """Interactive bounded graph explorer."""
+    return """<!DOCTYPE html>
+<html><head>
+<title>em0 Graph Explorer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  * { box-sizing:border-box; }
+  body { margin:0; background:#0b0f14; color:#dbe4ee; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; overflow:hidden; }
+  button,input,select { font:inherit; }
+  #topbar { height:56px; display:flex; align-items:center; gap:10px; padding:0 14px; background:#111821; border-bottom:1px solid #263241; }
+  #brand { font-weight:700; color:#7cc7ff; white-space:nowrap; }
+  #topbar input,#topbar select { height:34px; color:#dbe4ee; background:#0b0f14; border:1px solid #2f3f50; border-radius:6px; padding:0 10px; min-width:0; }
+  #apiKey { width:190px; }
+  #project { width:150px; }
+  #search { width:220px; }
+  #limit { width:86px; }
+  #labelFilter,#relationFilter { width:150px; }
+  button { height:34px; border:1px solid #2f3f50; border-radius:6px; color:#e8f1fb; background:#1b2733; padding:0 12px; cursor:pointer; }
+  button:hover { border-color:#7cc7ff; color:#7cc7ff; }
+  button.primary { background:#16794f; border-color:#229d68; color:#fff; }
+  button.primary:hover { background:#1e8d5e; color:#fff; }
+  button.warn { background:#58331a; border-color:#9a5a28; }
+  #status { margin-left:auto; color:#8ea0b4; font-size:12px; white-space:nowrap; }
+  #shell { display:grid; grid-template-columns:1fr 360px; height:calc(100vh - 56px); min-height:0; }
+  #graph { position:relative; min-width:0; }
+  #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8ea0b4; font-size:14px; pointer-events:none; }
+  #side { min-width:0; background:#111821; border-left:1px solid #263241; overflow:auto; }
+  .panel { padding:14px; border-bottom:1px solid #263241; }
+  .title { color:#8ea0b4; font-size:11px; text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px; }
+  .name { color:#f2f7fd; font-size:18px; font-weight:700; overflow-wrap:anywhere; margin-bottom:6px; }
+  .pill { display:inline-flex; align-items:center; height:22px; padding:0 8px; border-radius:999px; font-size:12px; border:1px solid currentColor; margin:0 6px 8px 0; }
+  .grid { display:grid; grid-template-columns:minmax(88px,120px) 1fr; gap:6px 10px; font-size:12px; }
+  .key { color:#8ea0b4; }
+  .val { color:#dbe4ee; overflow-wrap:anywhere; text-align:right; }
+  .row { display:flex; gap:8px; align-items:center; justify-content:space-between; padding:7px 0; border-bottom:1px solid #1e2a36; font-size:13px; }
+  .muted { color:#8ea0b4; }
+  .error { color:#ff8a80; }
+  .ok { color:#8ef0b1; }
+  .small { font-size:12px; }
+  #audit .row { align-items:flex-start; }
+  @media (max-width: 900px) {
+    #topbar { flex-wrap:wrap; height:112px; align-content:center; }
+    #shell { grid-template-columns:1fr; grid-template-rows:minmax(0,1fr) 300px; height:calc(100vh - 112px); }
+    #side { border-left:none; border-top:1px solid #263241; }
+    #apiKey,#project,#search,#labelFilter,#relationFilter { width:calc(50vw - 24px); }
+  }
+</style>
+</head><body>
+<div id="topbar">
+  <div id="brand">em0 Graph</div>
+  <input id="apiKey" type="password" placeholder="API key" onkeydown="if(event.key==='Enter')loadSlice()">
+  <input id="project" placeholder="Project" onkeydown="if(event.key==='Enter')loadSlice()">
+  <input id="search" placeholder="Search" onkeydown="if(event.key==='Enter')loadSlice()">
+  <select id="labelFilter"><option value="">All labels</option></select>
+  <select id="relationFilter"><option value="">All relations</option></select>
+  <input id="limit" type="number" min="1" max="2000" value="300">
+  <button class="primary" onclick="loadSlice()">Load</button>
+  <button onclick="runAudit()">Audit</button>
+  <button onclick="fitGraph()">Fit</button>
+  <button class="warn" onclick="clearPath()">Path</button>
+  <div id="status">idle</div>
+</div>
+<div id="shell">
+  <div id="graph"><div id="empty">Enter API key and load a slice</div></div>
+  <div id="side">
+    <div class="panel" id="summary">
+      <div class="title">Summary</div>
+      <div class="grid">
+        <div class="key">Nodes</div><div class="val" id="nodeCount">0</div>
+        <div class="key">Edges</div><div class="val" id="edgeCount">0</div>
+        <div class="key">Selected</div><div class="val" id="selectedCount">0</div>
+      </div>
+    </div>
+    <div class="panel" id="detail">
+      <div class="title">Node</div>
+      <div class="muted small">No selection</div>
+    </div>
+    <div class="panel" id="audit">
+      <div class="title">Audit</div>
+      <div class="muted small">Not run</div>
+    </div>
+  </div>
+</div>
+<script>
+let network, nodes, edges, currentData = {nodes: [], edges: []};
+let selectedPath = [];
+const colors = ['#7cc7ff','#f58f7c','#8ef0b1','#d6a6ff','#ffd166','#68d8d6','#ff9bc8','#a7c7e7','#f4a261','#b8f2e6'];
+const groupColors = {};
+let colorIndex = 0;
+
+function apiHeaders() {
+  return { Authorization: 'Bearer ' + document.getElementById('apiKey').value };
+}
+
+function setStatus(text, cls) {
+  const el = document.getElementById('status');
+  el.className = cls || '';
+  el.textContent = text;
+}
+
+function colorFor(group) {
+  if (!groupColors[group]) {
+    groupColors[group] = colors[colorIndex % colors.length];
+    colorIndex += 1;
+  }
+  return groupColors[group];
+}
+
+function queryString(params) {
+  const qs = new URLSearchParams();
+  Object.keys(params).forEach(k => {
+    if (params[k] !== undefined && params[k] !== null && params[k] !== '') qs.set(k, params[k]);
+  });
+  return qs.toString();
+}
+
+async function loadSlice() {
+  setStatus('loading', '');
+  const params = {
+    user_id: document.getElementById('project').value.trim(),
+    q: document.getElementById('search').value.trim(),
+    label: document.getElementById('labelFilter').value,
+    relation: document.getElementById('relationFilter').value,
+    limit: document.getElementById('limit').value || 300
+  };
+  try {
+    const res = await fetch('/admin/graph-slice?' + queryString(params), { headers: apiHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    currentData = { nodes: data.nodes || [], edges: data.edges || [] };
+    renderGraph(currentData);
+    populateFilters(data.filters || {});
+    updateSummary(data.stats || {});
+    setStatus((data.stats.nodes || 0) + ' nodes / ' + (data.stats.edges || 0) + ' edges', 'ok');
+  } catch (err) {
+    setStatus(err.message, 'error');
+  }
+}
+
+function populateFilters(filters) {
+  const labelSel = document.getElementById('labelFilter');
+  const relSel = document.getElementById('relationFilter');
+  const activeLabel = labelSel.value;
+  const activeRel = relSel.value;
+  labelSel.innerHTML = '<option value="">All labels</option>' + (filters.labels || []).map(r =>
+    '<option value="' + escAttr(r.label) + '">' + esc(r.label) + ' (' + r.count + ')</option>'
+  ).join('');
+  relSel.innerHTML = '<option value="">All relations</option>' + (filters.relations || []).map(r =>
+    '<option value="' + escAttr(r.type) + '">' + esc(r.type) + ' (' + r.count + ')</option>'
+  ).join('');
+  labelSel.value = activeLabel;
+  relSel.value = activeRel;
+}
+
+function renderGraph(data) {
+  document.getElementById('empty').style.display = data.nodes.length ? 'none' : 'flex';
+  const degree = {};
+  data.edges.forEach(e => {
+    degree[e.from] = (degree[e.from] || 0) + 1;
+    degree[e.to] = (degree[e.to] || 0) + 1;
+  });
+  nodes = new vis.DataSet(data.nodes.map(n => {
+    const c = colorFor(n.group);
+    return {
+      id: n.id,
+      label: n.label,
+      group: n.group,
+      props: n.properties || {},
+      title: esc(n.label),
+      size: Math.max(11, Math.min(38, 11 + (degree[n.id] || 0) * 3)),
+      color: { background: c, border: c, highlight: { background: '#f2f7fd', border: c } },
+      font: { color: '#dbe4ee', size: 13, face: '-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif' },
+      borderWidth: 2,
+      shape: 'dot'
+    };
+  }));
+  edges = new vis.DataSet(data.edges.map((e, i) => ({
+    id: 'edge-' + i + '-' + e.from + '-' + e.to + '-' + e.label,
+    from: e.from,
+    to: e.to,
+    label: e.label,
+    props: e.properties || {},
+    arrows: { to: { enabled: true, scaleFactor: .55 } },
+    color: { color: '#304255', highlight: '#7cc7ff', hover: '#7cc7ff' },
+    font: { color: '#8ea0b4', size: 10, strokeWidth: 0 },
+    smooth: { type: 'continuous' },
+    width: 1.4
+  })));
+  const container = document.getElementById('graph');
+  network = new vis.Network(container, { nodes, edges }, {
+    layout: { improvedLayout: data.nodes.length < 180 },
+    physics: {
+      solver: 'forceAtlas2Based',
+      forceAtlas2Based: { gravitationalConstant: -72, centralGravity: .009, springLength: 130, springConstant: .024, damping: .42 },
+      stabilization: { iterations: 260, fit: true }
+    },
+    interaction: { hover: true, multiselect: true, tooltipDelay: 180, zoomView: true, dragView: true }
+  });
+  network.on('click', event => {
+    const ids = event.nodes || [];
+    document.getElementById('selectedCount').textContent = ids.length;
+    if (ids.length) showNode(ids[0]);
+  });
+  network.on('doubleClick', event => {
+    if (event.nodes && event.nodes[0]) expandNode(event.nodes[0]);
+  });
+  updateSummary({});
+}
+
+function updateSummary(stats) {
+  document.getElementById('nodeCount').textContent = currentData.nodes.length;
+  document.getElementById('edgeCount').textContent = currentData.edges.length;
+  if (stats.limited) setStatus('limited to ' + currentData.nodes.length + ' nodes', '');
+}
+
+function showNode(id) {
+  const node = nodes.get(id);
+  if (!node) return;
+  const c = colorFor(node.group);
+  let html = '<div class="title">Node</div>';
+  html += '<div class="name">' + esc(node.label) + '</div>';
+  html += '<span class="pill" style="color:' + c + '">' + esc(node.group) + '</span>';
+  html += '<div style="display:flex;gap:8px;margin:8px 0 12px">';
+  html += '<button onclick="expandNode(\\'' + jsString(id) + '\\')">Expand</button>';
+  html += '<button onclick="pickForPath(\\'' + jsString(id) + '\\')">Pick</button>';
+  html += '</div><div class="grid">';
+  Object.keys(node.props || {}).sort().forEach(k => {
+    const v = String(node.props[k]);
+    html += '<div class="key">' + esc(k) + '</div><div class="val">' + esc(v.slice(0, 160)) + '</div>';
+  });
+  html += '</div>';
+  document.getElementById('detail').innerHTML = html;
+}
+
+async function expandNode(id) {
+  setStatus('expanding', '');
+  try {
+    const res = await fetch('/admin/graph-neighbors/' + encodeURIComponent(id) + '?depth=1&limit=300', { headers: apiHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    mergeGraph(data);
+    renderGraph(currentData);
+    network.selectNodes([id]);
+    setStatus('expanded ' + (data.stats.nodes || 0) + ' nodes', 'ok');
+  } catch (err) {
+    setStatus(err.message, 'error');
+  }
+}
+
+function mergeGraph(data) {
+  const byNode = {};
+  currentData.nodes.concat(data.nodes || []).forEach(n => { byNode[n.id] = n; });
+  const byEdge = {};
+  currentData.edges.concat(data.edges || []).forEach(e => {
+    byEdge[e.from + '|' + e.to + '|' + e.label] = e;
+  });
+  currentData = { nodes: Object.values(byNode), edges: Object.values(byEdge) };
+}
+
+function pickForPath(id) {
+  selectedPath = selectedPath.filter(x => x !== id);
+  selectedPath.push(id);
+  if (selectedPath.length > 2) selectedPath.shift();
+  setStatus(selectedPath.length === 2 ? 'path ready' : 'path start picked', '');
+  if (selectedPath.length === 2) loadPath();
+}
+
+async function loadPath() {
+  const params = queryString({ from_id: selectedPath[0], to_id: selectedPath[1], max_depth: 5 });
+  setStatus('path loading', '');
+  try {
+    const res = await fetch('/admin/graph-path?' + params, { headers: apiHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (!data.stats.found) {
+      setStatus('path not found', 'error');
+      return;
+    }
+    mergeGraph(data);
+    renderGraph(currentData);
+    network.selectNodes((data.nodes || []).map(n => n.id));
+    setStatus('path found', 'ok');
+  } catch (err) {
+    setStatus(err.message, 'error');
+  }
+}
+
+function clearPath() {
+  selectedPath = [];
+  setStatus('path cleared', '');
+}
+
+async function runAudit() {
+  setStatus('audit loading', '');
+  const params = queryString({ user_id: document.getElementById('project').value.trim(), duplicate_limit: 15 });
+  try {
+    const res = await fetch('/admin/graph-audit?' + params, { headers: apiHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    renderAudit(data);
+    setStatus('audit done', 'ok');
+  } catch (err) {
+    setStatus(err.message, 'error');
+  }
+}
+
+function renderAudit(data) {
+  const s = data.summary || {};
+  let html = '<div class="title">Audit</div>';
+  html += row('Nodes', s.nodes || 0);
+  html += row('Edges', s.edges || 0);
+  html += row('Isolated', s.isolated_nodes || 0);
+  html += row('Self loops', s.self_loops || 0);
+  html += row('Cross project', s.cross_project_edges || 0);
+  html += '<div class="title" style="margin-top:14px">Recommendations</div>';
+  (data.recommendations || []).forEach(item => {
+    html += '<div class="row"><div class="muted small">' + esc(item) + '</div></div>';
+  });
+  document.getElementById('audit').innerHTML = html;
+}
+
+function row(k, v) {
+  return '<div class="row"><span class="muted">' + esc(k) + '</span><strong>' + esc(String(v)) + '</strong></div>';
+}
+
+function fitGraph() {
+  if (network) network.fit({ animation: { duration: 350, easingFunction: 'easeInOutQuad' } });
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;');
+}
+
+function jsString(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+</script>
+</body></html>"""
 
 @app.get("/admin/graph", response_class=HTMLResponse)
 def graph_visualizer():
