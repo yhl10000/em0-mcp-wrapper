@@ -1942,6 +1942,10 @@ def graph_visualizer_v2():
       <div class="title">Node</div>
       <div class="muted small">No selection</div>
     </div>
+    <div class="panel" id="preview">
+      <div class="title">Data Preview</div>
+      <div class="muted small">No data loaded</div>
+    </div>
     <div class="panel" id="audit">
       <div class="title">Audit</div>
       <div class="muted small">Not run</div>
@@ -1999,6 +2003,7 @@ async function loadSlice() {
   try {
     const data = await fetchJson('/admin/graph-slice?' + queryString(params));
     currentData = { nodes: data.nodes || [], edges: data.edges || [] };
+    renderPreview(currentData);
     renderGraph(currentData);
     populateFilters(data.filters || {});
     updateSummary(data.stats || {});
@@ -2025,6 +2030,10 @@ function populateFilters(filters) {
 
 function renderGraph(data) {
   document.getElementById('empty').style.display = data.nodes.length ? 'none' : 'flex';
+  if (typeof vis === 'undefined') {
+    renderFallbackGraph(data);
+    return;
+  }
   const degree = {};
   data.edges.forEach(e => {
     degree[e.from] = (degree[e.from] || 0) + 1;
@@ -2103,11 +2112,59 @@ function showNode(id) {
   document.getElementById('detail').innerHTML = html;
 }
 
+function renderPreview(data) {
+  const el = document.getElementById('preview');
+  let html = '<div class="title">Data Preview</div>';
+  html += '<div class="row"><span class="muted">Loaded nodes</span><strong>' + data.nodes.length + '</strong></div>';
+  html += '<div class="row"><span class="muted">Loaded edges</span><strong>' + data.edges.length + '</strong></div>';
+  html += '<div class="title" style="margin-top:14px">First Nodes</div>';
+  data.nodes.slice(0, 12).forEach(n => {
+    html += '<div class="row"><span>' + esc(n.label) + '</span><span class="muted small">' + esc(n.group) + '</span></div>';
+  });
+  if (!data.nodes.length) html += '<div class="muted small">No nodes matched this slice.</div>';
+  el.innerHTML = html;
+}
+
+function renderFallbackGraph(data) {
+  const graph = document.getElementById('graph');
+  graph.innerHTML = '<div id="empty" style="display:none"></div>';
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'height:100%;overflow:auto;padding:18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;background:#0b0f14';
+  data.nodes.forEach(n => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.style.cssText = 'height:auto;text-align:left;padding:12px;border:1px solid #2f3f50;background:#111821;color:#dbe4ee;border-radius:6px';
+    item.innerHTML = '<strong>' + esc(n.label) + '</strong><div class="muted small">' + esc(n.group) + '</div>';
+    item.onclick = () => showFallbackNode(n.id);
+    wrap.appendChild(item);
+  });
+  graph.appendChild(wrap);
+  setStatus('renderer unavailable; showing list fallback', 'error');
+}
+
+function showFallbackNode(id) {
+  const node = currentData.nodes.find(n => n.id === id);
+  if (!node) return;
+  let html = '<div class="title">Node</div>';
+  html += '<div class="name">' + esc(node.label) + '</div>';
+  html += '<span class="pill">' + esc(node.group) + '</span>';
+  html += '<div style="display:flex;gap:8px;margin:8px 0 12px">';
+  html += '<button onclick="expandNode(\\'' + jsString(id) + '\\')">Expand</button>';
+  html += '<button onclick="pickForPath(\\'' + jsString(id) + '\\')">Pick</button>';
+  html += '</div><div class="grid">';
+  Object.keys(node.properties || {}).sort().forEach(k => {
+    html += '<div class="key">' + esc(k) + '</div><div class="val">' + esc(String(node.properties[k]).slice(0, 160)) + '</div>';
+  });
+  html += '</div>';
+  document.getElementById('detail').innerHTML = html;
+}
+
 async function expandNode(id) {
   setStatus('expanding', '');
   try {
     const data = await fetchJson('/admin/graph-neighbors/' + encodeURIComponent(id) + '?depth=1&limit=300');
     mergeGraph(data);
+    renderPreview(currentData);
     renderGraph(currentData);
     network.selectNodes([id]);
     setStatus('expanded ' + (data.stats.nodes || 0) + ' nodes', 'ok');
@@ -2144,6 +2201,7 @@ async function loadPath() {
       return;
     }
     mergeGraph(data);
+    renderPreview(currentData);
     renderGraph(currentData);
     network.selectNodes((data.nodes || []).map(n => n.id));
     setStatus('path found', 'ok');
@@ -2207,8 +2265,10 @@ async function fetchJson(url) {
 }
 
 function initGraphExplorer() {
-  const savedKey = localStorage.getItem('em0GraphApiKey');
-  if (savedKey) document.getElementById('apiKey').value = savedKey;
+  try {
+    const savedKey = localStorage.getItem('em0GraphApiKey');
+    if (savedKey) document.getElementById('apiKey').value = savedKey;
+  } catch (_) {}
   if (typeof vis === 'undefined') {
     setStatus('graph renderer failed to load', 'error');
   }
@@ -2225,7 +2285,8 @@ function escAttr(s) {
 }
 
 function jsString(s) {
-  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const slash = String.fromCharCode(92);
+  return String(s).replaceAll(slash, slash + slash).replaceAll("'", slash + "'");
 }
 
 initGraphExplorer();
