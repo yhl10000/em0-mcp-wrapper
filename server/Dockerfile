@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py scoring.py ./
+COPY main.py scoring.py mem0_compat.py ./
 
 # Data directory for history db
 RUN mkdir -p /data

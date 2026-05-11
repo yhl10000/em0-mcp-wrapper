@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from mem0_compat import search_memory as _mem0_search
 from pydantic import BaseModel
 from scoring import apply_freshness as _apply_freshness
 
@@ -386,7 +387,7 @@ def _check_conflicts(
 ) -> list[dict]:
     """Find existing memories that may conflict with new content."""
     try:
-        results = m.search(query=content, user_id=user_id, limit=3)
+        results = _mem0_search(m, query=content, user_id=user_id, limit=3)
         items = results.get("results", []) if isinstance(results, dict) else results
 
         conflicts = []
@@ -556,8 +557,8 @@ def search_all_projects(req: SearchAllRequest, authorization: str = Header("")):
         all_results = []
         for uid in user_ids:
             try:
-                results = m.search(
-                    query=req.query, user_id=uid, limit=per_project_limit,
+                results = _mem0_search(
+                    m, query=req.query, user_id=uid, limit=per_project_limit,
                 )
                 items = (
                     results.get("results", [])
@@ -618,21 +619,23 @@ def search_memory(req: SearchRequest, authorization: str = Header("")):
     _check_auth(authorization)
     m = _get_memory()
     try:
-        kwargs: dict[str, Any] = {
-            "query": req.query,
-            "user_id": req.user_id,
-            "limit": req.limit,
-        }
-        if req.filters:
-            kwargs["filters"] = req.filters
-
         # Use v2 API for graph-enhanced search
         if req.api_version == "v2" and graph_enabled:
-            results = m.search(**kwargs)
+            results = _mem0_search(
+                m,
+                query=req.query,
+                user_id=req.user_id,
+                limit=req.limit,
+                filters=req.filters,
+            )
             # Also get graph relations
             try:
-                graph_results = m.search(
-                    **kwargs,
+                graph_results = _mem0_search(
+                    m,
+                    query=req.query,
+                    user_id=req.user_id,
+                    limit=req.limit,
+                    filters=req.filters,
                     version="v2",
                 )
                 if isinstance(graph_results, dict) and "relations" in graph_results:
@@ -652,7 +655,13 @@ def search_memory(req: SearchRequest, authorization: str = Header("")):
                 _track_access(m, [i.get("id") for i in results["results"] if i.get("id")])
             return results if isinstance(results, dict) else {"results": results}
 
-        results = m.search(**kwargs)
+        results = _mem0_search(
+            m,
+            query=req.query,
+            user_id=req.user_id,
+            limit=req.limit,
+            filters=req.filters,
+        )
         if isinstance(results, dict):
             items = results.get("results", [])
             results["results"] = _apply_freshness(items)
@@ -863,8 +872,8 @@ def search_cross_project(req: CrossProjectSearchRequest, authorization: str = He
         current_project = req.user_id
 
         # Step 1: Find entities relevant to the query in current project
-        search_results = m.search(
-            query=req.query, user_id=current_project, limit=5,
+        search_results = _mem0_search(
+            m, query=req.query, user_id=current_project, limit=5,
         )
         search_items = (
             search_results.get("results", [])
@@ -976,7 +985,8 @@ def auto_context(project_id: str, authorization: str = Header("")):
     m = _get_memory()
     try:
         # 1. Recent decisions & architecture memories
-        recent = m.search(
+        recent = _mem0_search(
+            m,
             query=f"{project_id} decisions architecture conventions",
             user_id=project_id,
             limit=5,
