@@ -1889,7 +1889,8 @@ def graph_visualizer_v2():
   button.warn { background:#58331a; border-color:#9a5a28; }
   #status { margin-left:auto; color:#8ea0b4; font-size:12px; white-space:nowrap; }
   #shell { display:grid; grid-template-columns:1fr 360px; min-height:0; }
-  #graph { position:relative; min-width:0; }
+  #graph { position:relative; min-width:0; min-height:0; overflow:hidden; }
+  #network { position:absolute; inset:0; }
   #empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8ea0b4; font-size:14px; pointer-events:none; }
   #side { min-width:0; background:#111821; border-left:1px solid #263241; overflow:auto; }
   .panel { padding:14px; border-bottom:1px solid #263241; }
@@ -1928,7 +1929,7 @@ def graph_visualizer_v2():
   <div id="status">idle</div>
 </div>
 <div id="shell">
-  <div id="graph"><div id="empty">Enter API key and load a slice</div></div>
+  <div id="graph"><div id="network"></div><div id="empty">Enter API key and load a slice</div></div>
   <div id="side">
     <div class="panel" id="summary">
       <div class="title">Summary</div>
@@ -2029,9 +2030,27 @@ function populateFilters(filters) {
 }
 
 function renderGraph(data) {
-  document.getElementById('empty').style.display = data.nodes.length ? 'none' : 'flex';
+  const empty = document.getElementById('empty');
+  const container = document.getElementById('network');
+  if (!container) {
+    setStatus('graph container missing', 'error');
+    return;
+  }
+  if (network && typeof network.destroy === 'function') {
+    network.destroy();
+  }
+  network = null;
+  container.innerHTML = '';
+  if (empty) {
+    empty.textContent = data.nodes.length ? '' : 'No nodes matched this slice';
+    empty.style.display = data.nodes.length ? 'none' : 'flex';
+  }
   if (typeof vis === 'undefined') {
     renderFallbackGraph(data);
+    return;
+  }
+  if (!data.nodes.length) {
+    updateSummary({});
     return;
   }
   const degree = {};
@@ -2066,7 +2085,6 @@ function renderGraph(data) {
     smooth: { type: 'continuous' },
     width: 1.4
   })));
-  const container = document.getElementById('graph');
   network = new vis.Network(container, { nodes, edges }, {
     layout: { improvedLayout: data.nodes.length < 180 },
     physics: {
@@ -2084,6 +2102,8 @@ function renderGraph(data) {
   network.on('doubleClick', event => {
     if (event.nodes && event.nodes[0]) expandNode(event.nodes[0]);
   });
+  network.once('stabilizationIterationsDone', () => fitGraph());
+  window.setTimeout(() => fitGraph(), 250);
   updateSummary({});
 }
 
@@ -2126,8 +2146,9 @@ function renderPreview(data) {
 }
 
 function renderFallbackGraph(data) {
-  const graph = document.getElementById('graph');
-  graph.innerHTML = '<div id="empty" style="display:none"></div>';
+  const graph = document.getElementById('network');
+  if (!graph) return;
+  graph.innerHTML = '';
   const wrap = document.createElement('div');
   wrap.style.cssText = 'height:100%;overflow:auto;padding:18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;background:#0b0f14';
   data.nodes.forEach(n => {
@@ -2166,7 +2187,7 @@ async function expandNode(id) {
     mergeGraph(data);
     renderPreview(currentData);
     renderGraph(currentData);
-    network.selectNodes([id]);
+    if (network) network.selectNodes([id]);
     setStatus('expanded ' + (data.stats.nodes || 0) + ' nodes', 'ok');
   } catch (err) {
     setStatus(err.message, 'error');
@@ -2203,7 +2224,7 @@ async function loadPath() {
     mergeGraph(data);
     renderPreview(currentData);
     renderGraph(currentData);
-    network.selectNodes((data.nodes || []).map(n => n.id));
+    if (network) network.selectNodes((data.nodes || []).map(n => n.id));
     setStatus('path found', 'ok');
   } catch (err) {
     setStatus(err.message, 'error');
