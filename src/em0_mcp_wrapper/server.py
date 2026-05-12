@@ -153,7 +153,7 @@ async def search_memory(
             return _dump({"result": f"No memories found for '{query}'."})
         lines = [f"Found {len(items)} memory(ies) for '{query}':\n"]
         for i, m in enumerate(items, 1):
-            meta = m.get("metadata", {})
+            meta = m.get("metadata") or {}
             domain_tag = meta.get("domain", "?")
             type_tag = meta.get("type", "?")
             source = meta.get("source", "?")
@@ -225,7 +225,7 @@ async def search_all_projects(
         f"across {result.get('projects_searched', 0)} projects:\n"
     ]
     for i, m in enumerate(items, 1):
-        meta = m.get("metadata", {})
+        meta = m.get("metadata") or {}
         project = m.get("_project", m.get("user_id", "?"))
         domain = meta.get("domain", "?")
         mtype = meta.get("type", "?")

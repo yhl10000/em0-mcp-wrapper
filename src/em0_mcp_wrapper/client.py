@@ -14,9 +14,22 @@ RETRY_DELAY = 5  # seconds between retries
 
 
 def _headers() -> dict:
+    # Self-hosted Mem0 OSS server uses X-API-Key, not Bearer.
     return {
-        "Authorization": f"Bearer {config.MEM0_API_KEY}",
+        "X-API-Key": config.MEM0_API_KEY,
         "Content-Type": "application/json",
+    }
+
+
+def _not_supported(feature: str) -> dict:
+    return {
+        "error": "not_supported",
+        "feature": feature,
+        "hint": (
+            "This endpoint is not exposed by the self-hosted Mem0 OSS server. "
+            "Available tools: add_memory, search_memory, list_memories, get_memory, "
+            "update_memory, delete_memory."
+        ),
     }
 
 
@@ -79,6 +92,9 @@ async def add_memory(
         "messages": [{"role": "user", "content": content}],
         "user_id": user_id,
         "metadata": {k: v for k, v in metadata.items() if v},
+        # Self-hosted server's infer=true extraction loop is unreliable with current
+        # OpenRouter+DeepSeek combo; force literal storage.
+        "infer": False,
     }
     if immutable:
         payload["immutable"] = True
@@ -86,16 +102,16 @@ async def add_memory(
         payload["includes"] = includes
     if excludes:
         payload["excludes"] = excludes
-    return await request("POST", "/v1/memories/", json=payload)
+    return await request("POST", "/memories", json=payload)
 
 
 async def get_memory(memory_id: str) -> dict:
-    return await request("GET", f"/v1/memories/{memory_id}/")
+    return await request("GET", f"/memories/{memory_id}")
 
 
 async def update_memory(memory_id: str, content: str) -> dict:
     payload = {"data": content}
-    return await request("PUT", f"/v1/memories/{memory_id}/", json=payload)
+    return await request("PUT", f"/memories/{memory_id}", json=payload)
 
 
 async def search_memory(
@@ -104,104 +120,76 @@ async def search_memory(
     limit: int = 5,
     filters: dict | None = None,
 ) -> dict:
-    payload: dict = {"query": query, "user_id": user_id, "limit": limit}
-    if filters:
-        payload["filters"] = filters
-    return await request("POST", "/v1/memories/search/", json=payload)
+    # Self-hosted server requires user_id inside filters, not at top level.
+    merged_filters: dict = dict(filters) if filters else {}
+    if user_id:
+        merged_filters["user_id"] = user_id
+    payload: dict = {"query": query, "limit": limit, "filters": merged_filters}
+    return await request("POST", "/search", json=payload)
 
 
 async def list_memories(user_id: str) -> dict:
-    return await request("GET", "/v1/memories/", params={"user_id": user_id})
+    return await request("GET", "/memories", params={"user_id": user_id})
 
 
 async def delete_memory(memory_id: str) -> dict:
-    return await request("DELETE", f"/v1/memories/{memory_id}/")
+    return await request("DELETE", f"/memories/{memory_id}")
 
 
 async def memory_history(memory_id: str) -> dict:
-    return await request("GET", f"/v1/memories/{memory_id}/history/")
+    return await request("GET", f"/memories/{memory_id}/history")
 
 
 async def get_stats() -> dict:
-    return await request("GET", "/stats")
+    return _not_supported("memory_stats (/stats)")
 
 
 # ─── Graph Memory ───
 
 
 async def get_entities(user_id: str) -> dict:
-    """Get all entities (nodes) from the knowledge graph."""
-    return await request("GET", "/v1/entities/", params={"user_id": user_id})
+    return _not_supported("get_entities")
 
 
 async def get_relations(user_id: str) -> dict:
-    """Get all relationships between entities in the knowledge graph."""
-    return await request("GET", "/v1/relations/", params={"user_id": user_id})
+    return _not_supported("get_relations")
 
 
 async def search_graph(query: str, user_id: str, limit: int = 5) -> dict:
-    """Search using the knowledge graph (entity-relationship traversal)."""
-    payload = {
-        "query": query,
-        "user_id": user_id,
-        "limit": limit,
-        "api_version": "v2",
-    }
-    return await request("POST", "/v1/memories/search/", json=payload)
+    return _not_supported("search_graph")
 
 
 async def delete_entity(user_id: str, entity_name: str) -> dict:
-    """Delete a specific entity and its relations from the knowledge graph."""
-    return await request(
-        "DELETE", f"/v1/entities/{entity_name}/",
-        params={"user_id": user_id},
-    )
+    return _not_supported("delete_entity")
 
 
 # ─── Resources ───
 
 
 async def get_context(project_id: str) -> dict:
-    """Get auto-context for a project (session start)."""
-    return await request("GET", f"/v1/context/{project_id}")
+    return _not_supported("memory://context")
 
 
 async def get_project_summary(project_id: str) -> dict:
-    """Get project memory summary."""
-    return await request("GET", f"/v1/resources/summary/{project_id}")
+    return _not_supported("memory://project/summary")
 
 
 async def get_graph_summary(project_id: str) -> dict:
-    """Get knowledge graph summary."""
-    return await request("GET", f"/v1/resources/graph-summary/{project_id}")
+    return _not_supported("memory://project/graph")
 
 
 async def audit_graph(user_id: str = "", duplicate_limit: int = 25) -> dict:
-    """Run a read-only graph quality audit."""
-    return await request(
-        "GET",
-        "/admin/graph-audit",
-        params={"user_id": user_id, "duplicate_limit": duplicate_limit},
-    )
+    return _not_supported("audit_graph")
 
 
 async def search_all_projects(query: str, limit: int = 5) -> dict:
-    """Search across ALL projects — no user_id needed."""
-    return await request(
-        "POST", "/v1/memories/search-all/",
-        json={"query": query, "limit": limit},
-    )
+    return _not_supported("search_all_projects")
 
 
 async def search_cross_project(
     query: str, user_id: str, limit: int = 10,
 ) -> dict:
-    """Search for cross-project entity connections."""
-    return await request(
-        "POST",
-        "/v1/search/cross-project",
-        json={"query": query, "user_id": user_id, "limit": limit},
-    )
+    return _not_supported("search_cross_project")
 
 
 async def compact_memories(
@@ -210,14 +198,4 @@ async def compact_memories(
     min_cluster_size: int = 3,
     similarity_threshold: float = 0.85,
 ) -> dict:
-    """Compact similar memories within domain+type groups."""
-    return await request(
-        "POST",
-        "/admin/compact",
-        json={
-            "user_id": user_id,
-            "dry_run": dry_run,
-            "min_cluster_size": min_cluster_size,
-            "similarity_threshold": similarity_threshold,
-        },
-    )
+    return _not_supported("compact_memories")
