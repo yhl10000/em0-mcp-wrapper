@@ -31,6 +31,12 @@ MEM0_API_URL: str = os.environ.get("MEM0_API_URL", "").rstrip("/")
 MEM0_API_KEY: str = os.environ.get("MEM0_API_KEY", "")
 DEFAULT_USER_ID: str = _detect_project_id()
 REQUEST_TIMEOUT: int = int(os.environ.get("MEM0_TIMEOUT", "90"))
+INFER_MEMORIES: bool = os.environ.get("MEM0_INFER", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Safety limits
 MAX_MEMORY_LENGTH: int = int(os.environ.get("MEM0_MAX_LENGTH", "50000"))

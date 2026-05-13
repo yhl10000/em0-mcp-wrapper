@@ -92,9 +92,7 @@ async def add_memory(
         "messages": [{"role": "user", "content": content}],
         "user_id": user_id,
         "metadata": {k: v for k, v in metadata.items() if v},
-        # Self-hosted server's infer=true extraction loop is unreliable with current
-        # OpenRouter+DeepSeek combo; force literal storage.
-        "infer": False,
+        "infer": config.INFER_MEMORIES,
     }
     if immutable:
         payload["immutable"] = True
@@ -102,7 +100,24 @@ async def add_memory(
         payload["includes"] = includes
     if excludes:
         payload["excludes"] = excludes
-    return await request("POST", "/memories", json=payload)
+    result = await request("POST", "/memories", json=payload)
+    if (
+        config.INFER_MEMORIES
+        and isinstance(result, dict)
+        and result.get("results") == []
+    ):
+        fallback_payload = dict(payload)
+        fallback_payload["infer"] = False
+        fallback_result = await request("POST", "/memories", json=fallback_payload)
+        if isinstance(fallback_result, dict):
+            fallback_result["warning"] = (
+                "infer=true returned no extracted memories; retried with infer=false "
+                "to preserve the original content. Troubleshoot the Mem0 LLM extraction "
+                "prompt/model before removing this fallback."
+            )
+            fallback_result["infer_fallback"] = True
+        return fallback_result
+    return result
 
 
 async def get_memory(memory_id: str) -> dict:
