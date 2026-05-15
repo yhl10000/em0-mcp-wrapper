@@ -125,7 +125,9 @@ async def get_memory(memory_id: str) -> dict:
 
 
 async def update_memory(memory_id: str, content: str) -> dict:
-    payload = {"data": content}
+    # Self-hosted mem0 OSS server expects {"text": "..."} (not "data") on PUT /memories/{id}.
+    # Using the wrong field name returns HTTP 422: "body.text Field required".
+    payload = {"text": content}
     return await request("PUT", f"/memories/{memory_id}", json=payload)
 
 

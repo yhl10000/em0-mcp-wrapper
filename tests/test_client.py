@@ -91,11 +91,15 @@ async def test_get_memory():
 @respx.mock
 @pytest.mark.asyncio
 async def test_update_memory():
-    respx.put("https://test-mem0.example.com/v1/memories/abc123/").mock(
+    route = respx.put("https://test-mem0.example.com/memories/abc123").mock(
         return_value=httpx.Response(200, json={"id": "abc123", "event": "UPDATE"})
     )
     result = await client.update_memory("abc123", "updated content")
     assert result["event"] == "UPDATE"
+    # Regression guard: self-hosted mem0 OSS expects "text", not "data".
+    # Wrong field name returns HTTP 422 "body.text Field required".
+    sent_body = json.loads(route.calls[0].request.content)
+    assert sent_body == {"text": "updated content"}
 
 
 @respx.mock
